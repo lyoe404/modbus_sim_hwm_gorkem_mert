@@ -1,0 +1,66 @@
+# One command: `cp .env.example .env && docker compose up --build`
+services:
+  modbus-sim:
+    build: ./simulators
+    restart: unless-stopped
+    # Fault-injection admin API is unauthenticated by design (it is a test tool):
+    # published on the host loopback only. The Modbus port stays inside the compose network.
+    ports:
+      - "127.0.0.1:${SIM_ADMIN_PORT:-5021}:5021"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      modbus-sim:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (copy .env.example)}
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-viewer}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:?set VIEWER_PASSWORD in .env}
+      OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?set OPERATOR_PASSWORD in .env}
+      MODBUS_URL: tcp://modbus-sim:5020
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    volumes:
+      - backend-data:/data
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+
+volumes:
+  backend-data:
+  prometheus-data:
+  grafana-data:
