@@ -20,6 +20,7 @@ import (
 	"backend/internal/envfile"
 	"backend/internal/poller"
 	"backend/internal/relay"
+	"backend/internal/speed"
 	"backend/internal/store"
 )
 
@@ -93,18 +94,31 @@ func run(log *slog.Logger) error {
 	}
 	relays := &relay.Controller{URL: modbusURL, Timeout: 2 * time.Second, Labels: labels}
 	defer relays.Close()
+	speedControl := &speed.Controller{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}
+	defer speedControl.Close()
 
 	// Rules engine: reads fresh temperatures, drives the fan relay, thresholds live in the DB.
 	engine := control.New(control.Options{
-		Switch:   relaySwitch(relays),
-		Recorder: eventRecorder(db),
-		Store:    db,
-		Log:      log,
-		Channels: len(labels),
-		MaxAge:   3 * pollInterval, // never act on a reading older than three polls
+		Switch:    relaySwitch(relays),
+		FanReader: fanCoilReader{controller: relays},
+		Recorder:  eventRecorder(db),
+		Store:     db,
+		Log:       log,
+		Channels:  len(labels),
+		MaxAge:    3 * pollInterval, // never act on a reading older than three polls
 	})
 	if err := engine.Load(ctx); err != nil {
 		return err
+	}
+
+	// Persist each observed device health snapshot, including repeated failures and
+	// last-seen time. Do not use persisted online statuses to drive automation.
+	persistStatus := func(st poller.DeviceStatus) {
+		dbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := db.SaveDeviceStatus(dbCtx, st); err != nil && ctx.Err() == nil {
+			log.Error("persist device health", "device", st.Name, "err", err)
+		}
 	}
 
 	// Every connectivity change becomes an audit event and informs the engine.
@@ -135,12 +149,24 @@ func run(log *slog.Logger) error {
 		sensor, poller.MultiSink{db, poller.LogSink{Log: log}, engineSink{engine}}, log, onChange,
 	)
 
+	thermo := poller.New(poller.Config{Name: "thermocouple", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
+		&poller.Thermocouple{URL: env("THERMOCOUPLE_MODBUS_URL", "tcp://thermocouple-sim:5023"), Timeout: 2 * time.Second}, db, log, deviceEvent(db, log))
+	pwm := poller.New(poller.Config{Name: "fan_speed", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
+		&poller.SpeedReader{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}, db, log, deviceEvent(db, log))
+	// Read-only relay health polling does not interfere with writes.
+	relayHealth := poller.New(poller.Config{Name: "relay", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
+		relayReader{controller: relays}, noopSink{}, log, deviceEvent(db, log))
+	for _, current := range []*poller.Poller{p, relayHealth, thermo, pwm} {
+		current.SetOnPoll(persistStatus)
+	}
 	srv := &http.Server{
 		Addr: env("HTTP_ADDR", ":8080"),
 		Handler: (&api.Server{
-			Tokens: tokens, Users: users, Store: db, Relays: relays, Control: engine,
-			Statuses: func() []poller.DeviceStatus { return []poller.DeviceStatus{p.Status()} },
-			Log:      log,
+			Tokens: tokens, Users: users, Store: db, Relays: relays, Control: engine, Speed: speedControl,
+			Statuses: func() []poller.DeviceStatus {
+				return []poller.DeviceStatus{p.Status(), relayHealth.Status(), thermo.Status(), pwm.Status()}
+			},
+			Log: log,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -149,8 +175,11 @@ func run(log *slog.Logger) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(6)
 	go func() { defer wg.Done(); p.Run(ctx) }()
+	go func() { defer wg.Done(); relayHealth.Run(ctx) }()
+	go func() { defer wg.Done(); thermo.Run(ctx) }()
+	go func() { defer wg.Done(); pwm.Run(ctx) }()
 	go func() { defer wg.Done(); engine.Run(ctx) }()
 	go func() {
 		defer wg.Done()
