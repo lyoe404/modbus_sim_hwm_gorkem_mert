@@ -17,10 +17,13 @@ type State struct {
 	Mismatch    bool   `json:"mismatch"`
 }
 type Controller struct {
-	URL     string
-	Timeout time.Duration
-	mu      sync.Mutex
-	c       *modbus.ModbusClient
+	URL         string
+	Timeout     time.Duration
+	mu          sync.Mutex
+	c           *modbus.ModbusClient
+	lastCommand uint16
+	commandAt   time.Time
+	mismatchAt  time.Time
 }
 
 func (s *Controller) closeLocked() {
@@ -50,7 +53,22 @@ func (s *Controller) read() (State, error) {
 		s.closeLocked()
 		return State{}, err
 	}
-	return State{CommandPct: regs[0], FeedbackRPM: regs[1], Mismatch: abs(int(regs[1])-int(regs[0])*30) > 300}, nil
+	now := time.Now()
+	if s.commandAt.IsZero() || s.lastCommand != regs[0] {
+		s.lastCommand = regs[0]
+		s.commandAt = now
+		s.mismatchAt = time.Time{}
+	}
+	divergent := abs(int(regs[1])-int(regs[0])*30) > 300
+	if !divergent {
+		s.mismatchAt = time.Time{}
+	} else if s.mismatchAt.IsZero() {
+		s.mismatchAt = now
+	}
+	if regs[0] > 100 || regs[1] > 3000 {
+		return State{}, errors.New("invalid PWM registers")
+	}
+	return State{CommandPct: regs[0], FeedbackRPM: regs[1], Mismatch: divergent && now.Sub(s.commandAt) >= 5*time.Second && now.Sub(s.mismatchAt) >= 5*time.Second}, nil
 }
 func abs(x int) int {
 	if x < 0 {

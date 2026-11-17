@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"backend/internal/control"
 	"backend/internal/poller"
 	"backend/internal/relay"
+	"backend/internal/reset"
 	"backend/internal/speed"
 	"backend/internal/store"
 )
@@ -41,15 +43,21 @@ type Control interface {
 }
 
 // Server wires the dependencies of the API.
+type SpeedController interface {
+	Status(context.Context) (speed.State, error)
+	Set(context.Context, int) (speed.State, error)
+}
 type Server struct {
-	Tokens   *auth.Tokens
-	Users    *auth.Users
-	Store    Store
-	Relays   Relays
-	Control  Control
-	Speed    *speed.Controller
-	Statuses func() []poller.DeviceStatus
-	Log      *slog.Logger
+	Tokens       *auth.Tokens
+	Users        *auth.Users
+	Store        Store
+	Relays       Relays
+	Control      Control
+	Speed        SpeedController
+	Thermocouple *poller.Thermocouple
+	ResetDevice  func(context.Context, string) error
+	Statuses     func() []poller.DeviceStatus
+	Log          *slog.Logger
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -111,6 +119,8 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeErr(w, http.StatusForbidden, "forbidden")
 	}))))
+	mux.Handle("/api/reset", only(http.MethodPost, guard(auth.WriteReset, s.resetDevice)))
+	mux.Handle("/api/thermocouple", only(http.MethodGet, guard(auth.ReadThermocouple, s.getThermocouple)))
 	mux.Handle("/api/events", only(http.MethodGet, guard(auth.ReadEvents, s.events)))
 	mux.Handle("/api/fan/speed", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -240,6 +250,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRelays(w http.ResponseWriter, r *http.Request) {
+	if !s.deviceAvailable("relay") {
+		writeErr(w, 503, "device_recovering")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	chs, err := s.Relays.Channels(ctx)
@@ -271,6 +285,9 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 	var res relay.Result
 	var errWrite error
 	write := func() error {
+		if !s.deviceAvailable("relay") {
+			return errors.New("device recovering")
+		}
 		res, errWrite = s.Relays.Set(ctx, id, *req.On)
 		if errWrite == nil {
 			if observer, ok := s.Control.(interface{ ObserveManualRelay(int, bool) }); ok {
@@ -364,6 +381,10 @@ func (s *Server) putControl(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getSpeed(w http.ResponseWriter, r *http.Request) {
+	if !s.deviceAvailable("fan_speed") {
+		writeErr(w, 503, "device_recovering")
+		return
+	}
 	if s.Speed == nil {
 		writeErr(w, 503, "speed_unavailable")
 		return
@@ -378,6 +399,10 @@ func (s *Server) getSpeed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
+	if !s.deviceAvailable("fan_speed") {
+		writeErr(w, 503, "device_recovering")
+		return
+	}
 	if s.Speed == nil {
 		writeErr(w, 503, "speed_unavailable")
 		return
@@ -392,10 +417,25 @@ func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	st, err := s.Speed.Set(ctx, *req.Percent)
+	var st speed.State
+	perform := func() error { var err error; st, err = s.Speed.Set(ctx, *req.Percent); return err }
+	var err error
+	if ctl, ok := s.Control.(interface{ ManualSpeedOperation(func() error) error }); ok {
+		err = ctl.ManualSpeedOperation(perform)
+	} else if s.Control != nil && s.Control.Snapshot().Config.Enabled {
+		err = control.ErrFanAutoMode
+	} else {
+		err = perform()
+	}
+	if errors.Is(err, control.ErrFanAutoMode) {
+		writeErr(w, 409, "fan_in_auto_mode_switch_to_manual_first")
+		return
+	}
 	claims, _ := auth.ClaimsFrom(r.Context())
 	msg := fmt.Sprintf("speed_pct=%d feedback_rpm=%d error=%v", *req.Percent, st.FeedbackRPM, err)
-	if auditErr := s.Store.AddEvent(ctx, store.Event{Kind: "fan_speed_write", Source: "fan_speed", Message: msg, Actor: claims.Username}); auditErr != nil {
+	auditCtx, auditCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer auditCancel()
+	if auditErr := s.Store.AddEvent(auditCtx, store.Event{Kind: "fan_speed_write", Source: "fan_speed", Message: msg, Actor: claims.Username}); auditErr != nil {
 		s.Log.Error("speed audit", "err", auditErr)
 	}
 	if err != nil {
@@ -403,4 +443,74 @@ func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+func (s *Server) getThermocouple(w http.ResponseWriter, r *http.Request) {
+	if s.Thermocouple == nil {
+		writeErr(w, 503, "thermocouple_unavailable")
+		return
+	}
+	if !s.deviceAvailable("thermocouple") {
+		s.Thermocouple.Invalidate()
+	}
+	channels := s.Thermocouple.Channels()
+	all := true
+	for _, ch := range channels {
+		if ch.Status != "fault" {
+			all = false
+		}
+	}
+	writeJSON(w, 200, map[string]any{"channels": channels, "all_channels_faulted": all})
+}
+
+func (s *Server) resetDevice(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Target string `json:"target"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	claims, _ := auth.ClaimsFrom(r.Context())
+	err := json.NewDecoder(r.Body).Decode(&req)
+	result := "attempt"
+	audit := func(result string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if e := s.Store.AddEvent(ctx, store.Event{Kind: "device_reset", Source: req.Target, Actor: claims.Username, Message: result, At: time.Now()}); e != nil {
+			s.Log.Error("reset audit", "err", e)
+		}
+	}
+	audit(result)
+	if err != nil || !reset.Valid(req.Target) {
+		audit("invalid_target")
+		writeErr(w, 400, "invalid_target")
+		return
+	}
+	if s.ResetDevice == nil {
+		audit("unavailable")
+		writeErr(w, 503, "reset_unavailable")
+		return
+	}
+	if err = s.ResetDevice(r.Context(), req.Target); err != nil {
+		audit("failed: " + err.Error())
+		code := 502
+		var networkError net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkError) && networkError.Timeout()) {
+			code = 504
+		}
+		writeErr(w, code, "reset_failed")
+		return
+	}
+	audit("initiated")
+	writeJSON(w, 202, map[string]string{"target": req.Target, "state": "recovering"})
+}
+
+func (s *Server) deviceAvailable(name string) bool {
+	if s.Statuses == nil {
+		return true
+	}
+	for _, st := range s.Statuses() {
+		if st.Name == name {
+			return st.State == poller.StateOnline
+		}
+	}
+	return true
 }

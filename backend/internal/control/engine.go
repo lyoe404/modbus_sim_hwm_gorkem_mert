@@ -1,6 +1,7 @@
 package control
 
 import (
+	"backend/internal/speed"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,7 +63,12 @@ type Snapshot struct {
 }
 
 // Options configures an Engine.
+type SpeedControl interface {
+	Set(context.Context, int) (speed.State, error)
+	Status(context.Context) (speed.State, error)
+}
 type Options struct {
+	Speed     SpeedControl
 	Switch    Switch
 	FanReader FanReader
 	Recorder  Recorder
@@ -82,14 +88,17 @@ type Options struct {
 //     write is retried on the next reading, never assumed to have happened.
 //   - Inside the band with unknown state, the hardware is left untouched.
 type Engine struct {
-	sw        Switch
-	fanReader FanReader
-	rec       Recorder
-	db        Persistence
-	log       *slog.Logger
-	channels  int
-	maxAge    time.Duration
-	now       func() time.Time
+	speed         SpeedControl
+	speedFailing  bool
+	invalidBefore time.Time
+	sw            Switch
+	fanReader     FanReader
+	rec           Recorder
+	db            Persistence
+	log           *slog.Logger
+	channels      int
+	maxAge        time.Duration
+	now           func() time.Time
 
 	updateMu    sync.Mutex // serialises UpdateConfig
 	operationMu sync.Mutex // serialises mode switches against automatic actuations
@@ -116,7 +125,7 @@ func New(o Options) *Engine {
 		o.MaxAge = 10 * time.Second
 	}
 	return &Engine{
-		sw: o.Switch, fanReader: o.FanReader, rec: o.Recorder, db: o.Store, log: o.Log.With("component", "control"),
+		speed: o.Speed, sw: o.Switch, fanReader: o.FanReader, rec: o.Recorder, db: o.Store, log: o.Log.With("component", "control"),
 		channels: o.Channels, maxAge: o.MaxAge, now: o.Now,
 		cfg: DefaultConfig(), latest: make(chan Reading, 1),
 	}
@@ -290,6 +299,7 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	defer e.operationMu.Unlock()
 	e.mu.Lock()
 	cfg, gen := e.cfg, e.gen
+	invalidBefore := e.invalidBefore
 	e.mu.Unlock()
 	if !cfg.Enabled {
 		return
@@ -299,7 +309,10 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	case math.IsNaN(r.TempC) || math.IsInf(r.TempC, 0) || r.TempC < MinPlausibleC || r.TempC > MaxPlausibleC:
 		e.suspend(ctx, fmt.Sprintf("implausible reading %v", r.TempC))
 		return
-	case e.now().Sub(r.At) > e.maxAge:
+	case r.At.Before(invalidBefore):
+		e.suspend(ctx, "reading predates reset")
+		return
+	case r.At.IsZero() || r.At.After(e.now()) || e.now().Sub(r.At) > e.maxAge:
 		e.suspend(ctx, fmt.Sprintf("stale reading (%s old)", e.now().Sub(r.At).Round(time.Millisecond)))
 		return
 	}
@@ -342,6 +355,7 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	prev := cur != nil && *cur
 	want := NextFan(r.TempC, cfg.OnAbove, cfg.OffBelow, prev)
 	if cur != nil && *cur == want {
+		e.applySpeed(ctx, r.TempC, want)
 		return
 	}
 
@@ -367,6 +381,7 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	e.actFailing = false
 	e.mu.Unlock()
 
+	e.applySpeed(ctx, r.TempC, want)
 	kind := "fan_transition"
 	if cur == nil {
 		kind = "fan_sync"
@@ -386,4 +401,65 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// SpeedTarget is the reference linear curve, clamped to the physical range.
+func SpeedTarget(temp float64) int {
+	return int(math.Round(math.Max(0, math.Min(100, 20+(temp-25)*8))))
+}
+func (e *Engine) applySpeed(ctx context.Context, temp float64, on bool) {
+	if e.speed == nil {
+		return
+	}
+	target := 0
+	if on {
+		target = SpeedTarget(temp)
+	}
+	st, err := e.speed.Status(ctx)
+	changed := false
+	if err == nil && int(st.CommandPct) != target {
+		changed = true
+		_, err = e.speed.Set(ctx, target)
+	}
+	if err != nil {
+		if !e.speedFailing {
+			e.record(ctx, "fan_speed_failed", "fan_speed", err.Error(), actor)
+		}
+		e.speedFailing = true
+		return
+	}
+	if changed || e.speedFailing {
+		e.record(ctx, "fan_speed_transition", "fan_speed", fmt.Sprintf("percent=%d", target), actor)
+	}
+	e.speedFailing = false
+}
+func (e *Engine) ManualSpeedOperation(perform func() error) error {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
+	e.mu.Lock()
+	blocked := e.cfg.Enabled
+	e.mu.Unlock()
+	if blocked {
+		return ErrFanAutoMode
+	}
+	return perform()
+}
+
+// Device reset invalidates confirmed relay belief and queued readings atomically.
+func (e *Engine) ResetOperation(perform func() error) error {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
+	e.mu.Lock()
+	e.gen++
+	e.invalidBefore = e.now()
+	e.fanOn = nil
+	e.suspended = true
+	e.mu.Unlock()
+	for {
+		select {
+		case <-e.latest:
+		default:
+			return perform()
+		}
+	}
 }

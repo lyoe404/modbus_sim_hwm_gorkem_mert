@@ -24,8 +24,11 @@ type Poller struct {
 	onChange func(DeviceStatus)
 	onPoll   func(DeviceStatus)
 
-	mu     sync.RWMutex
-	status DeviceStatus
+	cycleMu    sync.Mutex
+	mu         sync.RWMutex
+	status     DeviceStatus
+	generation uint64
+	recovery   func(context.Context) (string, error)
 }
 
 // New builds a poller. onChange (optional) is called whenever State changes,
@@ -69,20 +72,52 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-timer.C:
 		}
 
+		p.mu.RLock()
+		gen, probe := p.generation, p.recovery
+		p.mu.RUnlock()
+		if probe != nil {
+			state, err := probe(ctx)
+			if err != nil || state != "online" {
+				p.mu.Lock()
+				if p.generation == gen {
+					p.status.State = State(state)
+					if err != nil {
+						p.status.State = StateUnknown
+						p.status.LastError = err.Error()
+					}
+				}
+				p.mu.Unlock()
+				timer.Reset(p.cfg.Interval)
+				continue
+			}
+		}
+		p.cycleMu.Lock()
 		ms, err := p.reader.Read(ctx)
+		p.mu.RLock()
+		valid := gen == p.generation
+		p.mu.RUnlock()
+		if !valid {
+			p.cycleMu.Unlock()
+			timer.Reset(p.cfg.Interval)
+			continue
+		}
 		if err != nil {
 			failures++
 			p.record(failures, err)
-			p.log.Warn("poll failed", "err", err, "consecutive_failures", failures)
 		} else {
 			failures = 0
-			p.record(0, nil)
-			// A storage problem is not a device problem: log it, keep the device online.
+			p.mu.Lock()
+			if p.generation == gen {
+				p.recovery = nil
+			}
+			p.mu.Unlock()
 			if serr := p.sink.Save(ctx, ms); serr != nil {
 				p.log.Error("persist failed", "err", serr)
 			}
+			p.record(0, nil)
 		}
 
+		p.cycleMu.Unlock()
 		next := p.cfg.Interval
 		if failures > 0 {
 			if d := p.cfg.Backoff.Delay(failures); d > next {
@@ -121,4 +156,16 @@ func (p *Poller) record(failures int, err error) {
 			p.onChange(cur)
 		}
 	}
+}
+
+// BeginReset rejects reads that started before reset and gates recovery on TCP status.
+func (p *Poller) BeginReset(probe func(context.Context) (string, error)) {
+	p.cycleMu.Lock()
+	defer p.cycleMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.generation++
+	p.recovery = probe
+	p.status.State = State("recovering")
+	p.status.LastSeen = time.Time{}
 }
