@@ -8,11 +8,12 @@ import (
 )
 
 type Store struct {
-	mu          sync.Mutex
-	targetPWM   uint16 // 0..100%
-	measuredRPM uint16 // 0..3000 RPM
-	faultMode   fault.Mode
-	faultDelay  time.Duration
+	mu               sync.Mutex
+	targetPWM        uint16  // 0..100%
+	measuredRPM      uint16  // 0..3000 RPM
+	feedbackOverride *uint16 // optional fixed tachometer reading for persistent mismatch
+	faultMode        fault.Mode
+	faultDelay       time.Duration
 }
 
 func NewStore() *Store {
@@ -28,6 +29,10 @@ func NewStore() *Store {
 func (s *Store) Step() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.feedbackOverride != nil {
+		s.measuredRPM = *s.feedbackOverride
+		return
+	}
 	desired := s.targetPWM * (MaxRPM / MaxPWMPercent)
 	if s.measuredRPM < desired {
 		diff := desired - s.measuredRPM
@@ -66,20 +71,36 @@ func (s *Store) WriteHolding(addr uint16, vals []uint16) (validAddr bool, validV
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Validate the complete request before modifying any state.
 	for i, v := range vals {
 		reg := addr + uint16(i)
-		if reg == RegTargetPWM {
-			if v > MaxPWMPercent {
-				return true, false
-			}
-			s.targetPWM = v
-		}
-		// RegMeasuredRPM is read-only telemetry; writes to reg 1 are ignored or rejected
-		if reg == RegMeasuredRPM {
+		if reg != RegTargetPWM {
 			return false, false
+		} // RPM telemetry is read-only
+		if v > MaxPWMPercent {
+			return true, false
 		}
 	}
+	s.targetPWM = vals[0]
 	return true, true
+}
+
+// SetFeedbackOverride pins the measured RPM independently of the PWM command.
+// nil restores normal convergence on the next Step.
+func (s *Store) SetFeedbackOverride(rpm *uint16) bool {
+	if rpm != nil && *rpm > MaxRPM {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rpm == nil {
+		s.feedbackOverride = nil
+	} else {
+		value := *rpm
+		s.feedbackOverride = &value
+		s.measuredRPM = value
+	}
+	return true
 }
 
 func (s *Store) SetFault(m fault.Mode, delay time.Duration) {
@@ -98,21 +119,23 @@ func (s *Store) Fault() (fault.Mode, time.Duration) {
 }
 
 type Snapshot struct {
-	Device      string     `json:"device"`
-	TargetPWM   uint16     `json:"target_pwm_pct"`
-	MeasuredRPM uint16     `json:"measured_rpm"`
-	Fault       fault.Mode `json:"fault"`
-	FaultDelay  string     `json:"fault_delay"`
+	Device           string     `json:"device"`
+	TargetPWM        uint16     `json:"target_pwm_pct"`
+	MeasuredRPM      uint16     `json:"measured_rpm"`
+	FeedbackOverride *uint16    `json:"feedback_override_rpm,omitempty"`
+	Fault            fault.Mode `json:"fault"`
+	FaultDelay       string     `json:"fault_delay"`
 }
 
 func (s *Store) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Snapshot{
-		Device:      "speed-control-pwm",
-		TargetPWM:   s.targetPWM,
-		MeasuredRPM: s.measuredRPM,
-		Fault:       s.faultMode,
-		FaultDelay:  s.faultDelay.String(),
+		Device:           "speed-control-pwm",
+		TargetPWM:        s.targetPWM,
+		MeasuredRPM:      s.measuredRPM,
+		FeedbackOverride: s.feedbackOverride,
+		Fault:            s.faultMode,
+		FaultDelay:       s.faultDelay.String(),
 	}
 }
