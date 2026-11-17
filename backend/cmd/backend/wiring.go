@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"backend/internal/control"
 	"backend/internal/poller"
@@ -41,4 +42,17 @@ func eventRecorder(db *store.Store) control.Recorder {
 	return control.RecorderFunc(func(ctx context.Context, kind, source, message, actor string) error {
 		return db.AddEvent(ctx, store.Event{Kind: kind, Source: source, Message: message, Actor: actor})
 	})
+}
+
+type fanCoilReader struct{ controller *relay.Controller }
+
+func (r fanCoilReader) ReadFan(ctx context.Context, channel int) (bool, error) {
+	channels, err := r.controller.Channels(ctx)
+	if err != nil {
+		return false, err
+	}
+	if channel < 0 || channel >= len(channels) {
+		return false, fmt.Errorf("fan channel %d out of range", channel)
+	}
+	return channels[channel].On, nil
 }
