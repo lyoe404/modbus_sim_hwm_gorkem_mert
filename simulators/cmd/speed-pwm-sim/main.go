@@ -135,6 +135,24 @@ func main() {
 		writeJSON(w, http.StatusOK, store.Snapshot())
 	})
 
+	mux.HandleFunc("/feedback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		raw := r.URL.Query().Get("rpm")
+		if raw == "auto" {
+			store.SetFeedbackOverride(nil)
+		} else {
+			n, err := strconv.ParseUint(raw, 10, 16)
+			if err != nil || !store.SetFeedbackOverride(func() *uint16 { v := uint16(n); return &v }()) {
+				http.Error(w, "rpm must be 0..3000 or auto", http.StatusBadRequest)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, store.Snapshot())
+	})
+
 	admin := &http.Server{
 		Addr:              env("ADMIN_ADDR", "0.0.0.0:5124"),
 		Handler:           mux,

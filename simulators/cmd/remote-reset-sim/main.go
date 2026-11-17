@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +23,24 @@ func env(k, def string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strings.TrimPrefix(env("TCP_ADDR", "0.0.0.0:9001"), "0.0.0.0:"), time.Second)
+		if err != nil {
+			os.Exit(1)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
+		_, err = fmt.Fprintln(conn, "PING")
+		if err != nil {
+			os.Exit(1)
+		}
+		response, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil || strings.TrimSpace(response) != "PONG" {
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

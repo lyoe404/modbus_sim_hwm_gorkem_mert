@@ -135,6 +135,19 @@ func main() {
 		writeJSON(w, http.StatusOK, store.Snapshot())
 	})
 
+	mux.HandleFunc("/channel-unpin", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		ch, err := strconv.Atoi(r.URL.Query().Get("ch"))
+		if err != nil || !store.UnpinChannel(ch) {
+			http.Error(w, "invalid channel (0..3)", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, store.Snapshot())
+	})
+
 	mux.HandleFunc("/channel-fault", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
