@@ -48,3 +48,18 @@ func TestInvalidRegisters(t *testing.T) {
 		}
 	}
 }
+
+func TestSignedTemperatureAndDedicatedSentinel(t *testing.T) {
+	s := NewStore()
+	s.PinChannel(0, -10.1)
+	s.PinChannel(1, -0.1)
+	regs, _ := s.InputRegisters(0, 4)
+	if int16(regs[0]) != -101 || int16(regs[1]) != -1 {
+		t.Fatalf("negative encoding: %x", regs)
+	}
+	for _, v := range []float64{-99999, -200, -0.1, 0, 1300, 99999} {
+		if toReg(v) == ChannelFaultSentinel {
+			t.Fatalf("valid encoding used fault sentinel: %v", v)
+		}
+	}
+}
