@@ -22,6 +22,12 @@ type Switch interface {
 	SetChannel(ctx context.Context, channel int, on bool) error
 }
 
+// FanReader reads the *actual* coil state, independent of the engine's
+// previously requested state. A failed read cannot authorize an auto write.
+type FanReader interface {
+	ReadFan(ctx context.Context, channel int) (bool, error)
+}
+
 // Recorder appends an audit event.
 type Recorder interface {
 	Record(ctx context.Context, kind, source, message, actor string) error
@@ -57,13 +63,14 @@ type Snapshot struct {
 
 // Options configures an Engine.
 type Options struct {
-	Switch   Switch
-	Recorder Recorder
-	Store    Persistence
-	Log      *slog.Logger
-	Channels int           // relay channels in use (validates fan_channel)
-	MaxAge   time.Duration // readings older than this are not acted on
-	Now      func() time.Time
+	Switch    Switch
+	FanReader FanReader
+	Recorder  Recorder
+	Store     Persistence
+	Log       *slog.Logger
+	Channels  int           // relay channels in use (validates fan_channel)
+	MaxAge    time.Duration // readings older than this are not acted on
+	Now       func() time.Time
 }
 
 // Engine consumes temperature readings and drives the fan relay.
@@ -75,15 +82,17 @@ type Options struct {
 //     write is retried on the next reading, never assumed to have happened.
 //   - Inside the band with unknown state, the hardware is left untouched.
 type Engine struct {
-	sw       Switch
-	rec      Recorder
-	db       Persistence
-	log      *slog.Logger
-	channels int
-	maxAge   time.Duration
-	now      func() time.Time
+	sw        Switch
+	fanReader FanReader
+	rec       Recorder
+	db        Persistence
+	log       *slog.Logger
+	channels  int
+	maxAge    time.Duration
+	now       func() time.Time
 
-	updateMu sync.Mutex // serialises UpdateConfig
+	updateMu    sync.Mutex // serialises UpdateConfig
+	operationMu sync.Mutex // serialises mode switches against automatic actuations
 
 	mu         sync.Mutex
 	cfg        Config
@@ -107,7 +116,7 @@ func New(o Options) *Engine {
 		o.MaxAge = 10 * time.Second
 	}
 	return &Engine{
-		sw: o.Switch, rec: o.Recorder, db: o.Store, log: o.Log.With("component", "control"),
+		sw: o.Switch, fanReader: o.FanReader, rec: o.Recorder, db: o.Store, log: o.Log.With("component", "control"),
 		channels: o.Channels, maxAge: o.MaxAge, now: o.Now,
 		cfg: DefaultConfig(), latest: make(chan Reading, 1),
 	}
@@ -157,6 +166,8 @@ func (e *Engine) UpdateConfig(ctx context.Context, cfg Config, by string) error 
 	}
 	e.updateMu.Lock()
 	defer e.updateMu.Unlock()
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
 
 	b, err := json.Marshal(cfg)
 	if err != nil {
@@ -181,7 +192,17 @@ func (e *Engine) UpdateConfig(ctx context.Context, cfg Config, by string) error 
 		"enabled=%t on_above=%.1f off_below=%.1f fan_channel=%d (was enabled=%t on_above=%.1f off_below=%.1f fan_channel=%d)",
 		cfg.Enabled, cfg.OnAbove, cfg.OffBelow, cfg.FanChannel,
 		old.Enabled, old.OnAbove, old.OffBelow, old.FanChannel), by)
+	if old.Enabled != cfg.Enabled {
+		e.record(ctx, "control_mode_change", "fan", fmt.Sprintf("mode=%s", modeName(cfg.Enabled)), by)
+	}
 	return nil
+}
+
+func modeName(auto bool) string {
+	if auto {
+		return "AUTO"
+	}
+	return "MANUAL"
 }
 
 // Observe hands the engine a fresh reading. It never blocks: if the engine is
@@ -208,6 +229,39 @@ func (e *Engine) OnStatus(ctx context.Context, online bool) {
 	}
 }
 
+// ErrFanAutoMode indicates the automatic loop owns this relay channel.
+var ErrFanAutoMode = errors.New("fan channel is controlled in AUTO mode")
+
+// ManualOperation serializes a manual relay command with the automatic loop
+// and mode changes. Other channels remain independently writable in AUTO.
+// The supplied closure must only update engine belief after verified read-back.
+func (e *Engine) ManualOperation(channel int, perform func() error) error {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
+	e.mu.Lock()
+	blocked := e.cfg.Enabled && e.cfg.FanChannel == channel
+	e.mu.Unlock()
+	if blocked {
+		return ErrFanAutoMode
+	}
+	return perform()
+}
+
+// ObserveManualRelay reconciles an operator's confirmed coil read-back with the
+// automation's internal state. The next fresh sensor sample will re-evaluate
+// the hysteresis policy; a failed/unconfirmed write must never call this.
+func (e *Engine) ObserveManualRelay(channel int, on bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if channel != e.cfg.FanChannel {
+		return
+	}
+	v := on
+	e.fanOn = &v
+	e.actFailing = false
+	e.gen++ // reject any concurrent automatic operation's stale belief
+}
+
 // Run processes readings until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	for {
@@ -232,6 +286,8 @@ func (e *Engine) suspend(ctx context.Context, reason string) {
 }
 
 func (e *Engine) step(ctx context.Context, r Reading) {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
 	e.mu.Lock()
 	cfg, gen := e.cfg, e.gen
 	e.mu.Unlock()
@@ -246,6 +302,28 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	case e.now().Sub(r.At) > e.maxAge:
 		e.suspend(ctx, fmt.Sprintf("stale reading (%s old)", e.now().Sub(r.At).Round(time.Millisecond)))
 		return
+	}
+
+	// Re-read physical feedback before deciding. An external Modbus client or
+	// simulator restart may have changed the coil without going through our API.
+	// Inside the hysteresis band we preserve the *device's* state, not a guess.
+	if e.fanReader != nil {
+		actual, err := e.fanReader.ReadFan(ctx, cfg.FanChannel)
+		if err != nil {
+			e.suspend(ctx, fmt.Sprintf("fan feedback unavailable: %v", err))
+			return
+		}
+		e.mu.Lock()
+		if e.gen != gen || !e.cfg.Enabled {
+			e.mu.Unlock()
+			return
+		}
+		if e.fanOn == nil || *e.fanOn != actual {
+			e.log.Info("fan coil reconciled from read-back", "channel", cfg.FanChannel, "actual", actual)
+		}
+		v := actual
+		e.fanOn = &v
+		e.mu.Unlock()
 	}
 
 	e.mu.Lock()
