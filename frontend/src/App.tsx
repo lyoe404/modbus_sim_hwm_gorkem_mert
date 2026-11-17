@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertTriangle, CheckCircle2, Cpu, Lock, LogOut, Power, RefreshCw, Shield, Sliders } from 'lucide-react';
+import { Activity, AlertTriangle, CheckCircle2, Cpu, ExternalLink, Lock, LogOut, Power, RefreshCw, Shield, Sliders } from 'lucide-react';
 import { api, ApiError } from './api';
 import { LiveChart } from './LiveChart';
 import { AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
@@ -7,8 +7,8 @@ import { AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChann
 export function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('hwm_token'));
   const [me, setMe] = useState<UserMe | null>(null);
-  const [username, setUsername] = useState('operator');
-  const [password, setPassword] = useState('operator-dev-pass');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
   const [loadingLogin, setLoadingLogin] = useState(false);
 
@@ -16,9 +16,16 @@ export function App() {
   const [devices, setDevices] = useState<DeviceStatus[]>([]);
   const [temps, setTemps] = useState<MeasurementPoint[]>([]);
   const [humids, setHumids] = useState<MeasurementPoint[]>([]);
+  const [sensorFetchFailed, setSensorFetchFailed] = useState(false);
+  const [clock, setClock] = useState(() => Date.now());
   const [relays, setRelays] = useState<RelayChannel[]>([]);
+  const [relayError, setRelayError] = useState<string | null>(null);
   const [control, setControl] = useState<ControlSnapshot | null>(null);
   const [events, setEvents] = useState<AuditEvent[]>([]);
+  // This value comes from Prometheus's query API, not the backend's sensor API.
+  const [prometheusTemperature, setPrometheusTemperature] = useState<number | null>(null);
+  const [prometheusError, setPrometheusError] = useState<string | null>(null);
+
 
   const [busyRelay, setBusyRelay] = useState<number | null>(null);
   const [actionMsg, setActionMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -57,6 +64,11 @@ export function App() {
       });
   }, [token, logout]);
 
+  useEffect(() => {
+    const id = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
   // Poll live telemetry & state
   const pollAll = useCallback(async () => {
     if (!token || !me) return;
@@ -67,13 +79,26 @@ export function App() {
         tasks.push(api.devices(token).then(setDevices));
       }
       if (hasPerm('read:sensor')) {
-        tasks.push(api.measurements(token, 'sensor', 'temperature_c', 50).then(setTemps));
-        tasks.push(api.measurements(token, 'sensor', 'humidity_pct', 50).then(setHumids));
+        tasks.push(Promise.all([
+          api.measurements(token, 'sensor', 'temperature_c', 50),
+          api.measurements(token, 'sensor', 'humidity_pct', 50),
+        ]).then(([tempPoints, humidityPoints]) => {
+          setTemps(tempPoints);
+          setHumids(humidityPoints);
+          setSensorFetchFailed(false);
+        }).catch(err => {
+          setSensorFetchFailed(true);
+          if (err instanceof ApiError && err.status === 401) throw err;
+        }));
       }
       if (hasPerm('read:relay')) {
         tasks.push(
-          api.relays(token).then(setRelays).catch(() => {
-            /* keep last known or surface degraded via devices */
+          api.relays(token).then((channels) => {
+            setRelays(channels); setRelayError(null);
+          }).catch((error) => {
+            setRelays([]); // never portray a stale coil state as an actual read-back
+            setRelayError(error instanceof ApiError ? error.code : 'relay_unreachable');
+            if (error instanceof ApiError && error.status === 401) throw error;
           })
         );
       }
@@ -108,6 +133,48 @@ export function App() {
     return () => clearInterval(id);
   }, [token, me, pollAll]);
 
+  useEffect(() => {
+    if (!token || !me || !hasPerm('read:sensor')) {
+      setPrometheusTemperature(null);
+      setPrometheusError(null);
+      return;
+    }
+
+    let active = true;
+    const pollPrometheus = async () => {
+      try {
+        const response = await fetch('/prometheus/api/v1/query?query=hwm_sensor_temperature_celsius', {
+          cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`Prometheus HTTP ${response.status}`);
+        const payload: {
+          status?: string;
+          data?: { result?: Array<{ value?: [number, string] }> };
+        } = await response.json();
+        const sample = payload.data?.result?.[0]?.value?.[1];
+        const value = sample === undefined ? NaN : Number(sample);
+        if (payload.status !== 'success' || !Number.isFinite(value)) {
+          throw new Error('No current Prometheus temperature sample');
+        }
+        if (active) {
+          setPrometheusTemperature(value);
+          setPrometheusError(null);
+        }
+      } catch (error) {
+        if (active) {
+          setPrometheusTemperature(null);
+          setPrometheusError(error instanceof Error ? error.message : 'Prometheus unavailable');
+        }
+      }
+    };
+    void pollPrometheus();
+    const timer = window.setInterval(() => void pollPrometheus(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [token, me, hasPerm]);
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoadingLogin(true);
@@ -124,7 +191,11 @@ export function App() {
   };
 
   const toggleRelay = async (ch: RelayChannel) => {
-    if (!token || !hasPerm('write:relay')) return;
+    if (!token || !hasPerm('write:relay') || !relayDeviceOnline || backendOffline) return;
+    if (control?.config.enabled && ch.id === control.config.fan_channel) {
+      setActionMsg({ type: 'err', text: 'Fan is in AUTO mode. Select MANUAL and save the control mode before toggling Fan 1.' });
+      return;
+    }
     setBusyRelay(ch.id);
     setActionMsg(null);
     try {
@@ -135,6 +206,8 @@ export function App() {
     } catch (err) {
       const msg = err instanceof ApiError ? err.code : 'relay_write_failed';
       setActionMsg({ type: 'err', text: `Relay ${ch.label} failed: ${msg}` });
+      setRelays([]);
+      setRelayError(msg);
     } finally {
       setBusyRelay(null);
     }
@@ -153,7 +226,7 @@ export function App() {
         fan_channel: parseInt(fanChInput, 10),
       });
       setControl(snap);
-      setActionMsg({ type: 'ok', text: 'Control thresholds updated and audited.' });
+      setActionMsg({ type: 'ok', text: `Control configuration saved: ${snap.config.enabled ? 'AUTO' : 'MANUAL'} mode. Changes audited.` });
       pollAll();
     } catch (err) {
       setActionMsg({ type: 'err', text: `Config update rejected: ${err instanceof ApiError ? err.code : 'error'}` });
@@ -213,38 +286,25 @@ export function App() {
             </button>
           </form>
 
-          <div className="mt-6 pt-4 border-t border-slate-800 text-xs text-slate-400 space-y-1.5">
-            <div className="font-medium text-slate-300">Quick-fill Test Accounts:</div>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setUsername('viewer');
-                  setPassword('viewer-dev-pass');
-                }}
-                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
-              >
-                viewer (Read-Only)
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setUsername('operator');
-                  setPassword('operator-dev-pass');
-                }}
-                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
-              >
-                operator (Full Control)
-              </button>
-            </div>
-          </div>
+
         </div>
       </div>
     );
   }
 
   const canWriteRelay = hasPerm('write:relay');
+  const relayDeviceOnline = devices.some(d => d.name === 'relay' && d.state === 'online');
+  const sensorDeviceOnline = devices.some(d => d.name === 'sensor' && d.state === 'online');
   const canWriteThresholds = hasPerm('write:thresholds');
+  const sensorLatestAt = Math.max(0, ...[temps[temps.length - 1], humids[humids.length - 1]]
+    .filter((point): point is MeasurementPoint => Boolean(point))
+    .map(point => new Date(point.at).getTime()));
+  const sensorQuality: 'live' | 'stale' | 'unknown' =
+    backendOffline || sensorFetchFailed || !sensorDeviceOnline || sensorLatestAt === 0
+      ? 'unknown'
+      : clock - sensorLatestAt > 10000 ? 'stale' : 'live';
+  const autoFanChannel = control?.config.fan_channel;
+  const autoFanActive = control?.config.enabled === true;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -285,6 +345,17 @@ export function App() {
             <div className="text-sm">
               <strong>Backend Unreachable:</strong> Live telemetry polling is degraded. Retrying every 2s...
             </div>
+          </div>
+        )}
+
+        {relayError && hasPerm('read:relay') && (
+          <div role="alert" className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/40 text-amber-200 text-sm">
+            Relay status unknown: {relayError}. Controls are disabled until a verified read-back succeeds.
+          </div>
+        )}
+        {hasPerm('read:sensor') && !sensorDeviceOnline && (
+          <div role="status" className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/40 text-amber-200 text-sm">
+            Sensor offline or waiting for first read. Historical chart points are not current measurements.
           </div>
         )}
 
@@ -346,7 +417,7 @@ export function App() {
                     ? 'SUSPENDED (Stale/Offline)'
                     : control.config.enabled
                     ? `AUTO (${control.fan_on === null ? 'UNKNOWN' : control.fan_on ? 'FAN ON' : 'FAN OFF'})`
-                    : 'DISABLED'}
+                    : 'MANUAL (AUTO OFF)'}
                 </div>
                 <div className="text-xs text-slate-400 mt-0.5">
                   Band: {control.config.off_below}°C – {control.config.on_above}°C (Ch {control.config.fan_channel})
@@ -369,7 +440,45 @@ export function App() {
           </div>
         </section>
 
-        {/* Live Telemetry Charts */}
+        {/* Live metric queried from Prometheus (not the ordinary telemetry API). */}
+        {hasPerm('read:sensor') && (
+          <section className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+              <div>
+                <h2 className="font-semibold text-white">Prometheus / Grafana Observability</h2>
+                <p className="text-xs text-slate-400">Source: Prometheus query API · hwm_sensor_temperature_celsius · refresh every 5s</p>
+              </div>
+              <a
+                href={`${window.location.protocol}//${window.location.hostname}:${import.meta.env.VITE_GRAFANA_PORT || '3001'}/d/hwm-industrial-overview`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500"
+              >
+                Open Grafana Dashboard <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            </div>
+            {prometheusTemperature !== null ? (
+              <div className="text-3xl font-semibold text-emerald-300">
+                {prometheusTemperature.toFixed(1)} °C
+                <span className="ml-3 text-xs font-normal text-slate-400">Live Prometheus sample</span>
+              </div>
+            ) : (
+              <div className="text-sm text-amber-300">
+                Prometheus data unavailable: {prometheusError || 'Waiting for first scrape'}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Device state is authoritative; database history remains viewable when stale. */}
+        {hasPerm('read:sensor') && (
+          <div role="status" className={`rounded-lg px-4 py-2 text-sm border ${sensorQuality === 'live' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' : 'bg-amber-500/10 border-amber-500/30 text-amber-300'}`}>
+            Sensor telemetry: <strong>{sensorQuality.toUpperCase()}</strong>
+            {sensorLatestAt > 0 ? ` · last sample ${new Date(sensorLatestAt).toLocaleTimeString()} (${Math.max(0, Math.round((clock - sensorLatestAt) / 1000))}s ago)` : ' · no sample received'}
+            {sensorQuality !== 'live' && ' · charts below are historical and must not be used for live control'}
+          </div>
+        )}
+        {/* Live Telemetry Charts (historical samples; connectivity is shown independently) */}
         {hasPerm('read:sensor') && (
           <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <LiveChart
@@ -377,6 +486,7 @@ export function App() {
               unit="°C"
               color="#f97316"
               points={temps}
+              quality={sensorQuality}
               upperThreshold={control?.config.on_above}
               lowerThreshold={control?.config.off_below}
             />
@@ -385,6 +495,7 @@ export function App() {
               unit="%"
               color="#38bdf8"
               points={humids}
+              quality={sensorQuality}
             />
           </section>
         )}
@@ -411,15 +522,15 @@ export function App() {
                   <button
                     key={ch.id}
                     type="button"
-                    disabled={!canWriteRelay || busyRelay === ch.id}
+                    disabled={!canWriteRelay || !relayDeviceOnline || backendOffline || busyRelay !== null || (autoFanActive && ch.id === autoFanChannel)}
                     onClick={() => toggleRelay(ch)}
-                    title={!canWriteRelay ? 'Requires write:relay capability' : `Toggle ${ch.label}`}
+                    title={!canWriteRelay ? 'Requires write:relay capability' : (autoFanActive && ch.id === autoFanChannel) ? 'Fan is controlled automatically. Change mode to MANUAL and save first.' : `Toggle ${ch.label}`}
                     className={`p-3.5 rounded-xl border text-left transition flex flex-col justify-between gap-3 ${
                       ch.on
                         ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-100'
                         : 'bg-slate-950 border-slate-800 text-slate-300'
                     } ${
-                      !canWriteRelay
+                      (!canWriteRelay || !relayDeviceOnline || backendOffline || (autoFanActive && ch.id === autoFanChannel))
                         ? 'opacity-60 cursor-not-allowed'
                         : 'hover:border-indigo-500 cursor-pointer'
                     }`}
@@ -436,6 +547,7 @@ export function App() {
                       <div className="font-medium text-sm truncate">{ch.label}</div>
                       <div className="text-xs font-semibold mt-0.5">
                         {busyRelay === ch.id ? 'WRITING...' : ch.on ? 'ON' : 'OFF'}
+                        {autoFanActive && ch.id === autoFanChannel && <span className="block text-[10px] text-amber-300">AUTO LOCK</span>}
                       </div>
                     </div>
                   </button>
@@ -459,6 +571,11 @@ export function App() {
                 )}
               </div>
 
+              <p className="text-xs text-slate-400 mb-3">
+                AUTO: temperature controls the fan; the configured fan relay is locked.
+                MANUAL: authorized operators may toggle the fan relay directly.
+                Select a mode and click Save to apply it.
+              </p>
               <form onSubmit={saveControlConfig} className="space-y-3">
                 <label className="flex items-center gap-2 text-sm text-slate-300">
                   <input
@@ -469,7 +586,7 @@ export function App() {
                     onChange={(e) => setEnabledInput(e.target.checked)}
                     className="rounded bg-slate-950 border-slate-700"
                   />
-                  Enable Hysteresis Auto-Control
+                  AUTO mode (unchecked = MANUAL mode)
                 </label>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -522,7 +639,7 @@ export function App() {
                     ? 'Requires write:thresholds'
                     : savingCfg
                     ? 'Saving...'
-                    : 'Apply Thresholds'}
+                    : 'Save Mode & Thresholds'}
                 </button>
               </form>
             </div>

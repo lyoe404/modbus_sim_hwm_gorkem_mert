@@ -6,11 +6,12 @@ interface Props {
   unit: string;
   color: string;
   points: MeasurementPoint[];
+  quality?: 'live' | 'stale' | 'unknown';
   upperThreshold?: number;
   lowerThreshold?: number;
 }
 
-export const LiveChart: React.FC<Props> = ({ title, unit, color, points, upperThreshold, lowerThreshold }) => {
+export const LiveChart: React.FC<Props> = ({ title, unit, color, points, upperThreshold, lowerThreshold, quality = 'unknown' }) => {
   const sorted = [...points].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
   const latest = sorted[sorted.length - 1];
 
@@ -40,9 +41,10 @@ export const LiveChart: React.FC<Props> = ({ title, unit, color, points, upperTh
         <div>
           <h3 className="text-sm font-medium text-slate-400">{title}</h3>
           <div className="text-2xl font-bold text-slate-100 mt-0.5">
-            {latest ? `${latest.value.toFixed(1)} ${unit}` : `-- ${unit}`}
+            {latest && quality === 'live' ? `${latest.value.toFixed(1)} ${unit}` : `-- ${unit}`}
           </div>
         </div>
+        <span className={`text-xs font-semibold ${quality === 'live' ? 'text-emerald-400' : 'text-amber-300'}`}>{quality.toUpperCase()}</span>
         {latest && (
           <span className="text-xs text-slate-500">
             Updated {new Date(latest.at).toLocaleTimeString()}
