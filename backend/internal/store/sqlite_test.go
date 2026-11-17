@@ -115,3 +115,27 @@ func TestConfigRoundTripAndOverwrite(t *testing.T) {
 		t.Fatalf("got %q found=%v err=%v", v, found, err)
 	}
 }
+
+func TestDeviceStatePersistence(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	st := poller.DeviceStatus{Name: "relay", State: poller.StateOffline, ConsecutiveFailures: 3, LastError: "timeout"}
+	if err := db.SaveDeviceStatus(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := db.DeviceStates(ctx)
+	if err != nil || len(statuses) != 1 || statuses[0].State != poller.StateOffline || statuses[0].ConsecutiveFailures != 3 {
+		t.Fatalf("offline row: %+v, %v", statuses, err)
+	}
+	st.State = poller.StateOnline
+	st.LastSeen = time.Now().UTC().Truncate(time.Millisecond)
+	st.LastError = ""
+	st.ConsecutiveFailures = 0
+	if err := db.SaveDeviceStatus(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = db.DeviceStates(ctx)
+	if err != nil || len(statuses) != 1 || statuses[0].State != poller.StateOnline || statuses[0].LastSeen.IsZero() {
+		t.Fatalf("recovered row: %+v, %v", statuses, err)
+	}
+}
