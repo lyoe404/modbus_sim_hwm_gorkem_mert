@@ -92,7 +92,12 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("relay labels: %w", err)
 	}
-	relays := &relay.Controller{URL: modbusURL, Timeout: 2 * time.Second, Labels: labels}
+	relayURL := env("RELAY_MODBUS_URL", "tcp://relay-sim:5022")
+	relays := &relay.Controller{
+		URL:     relayURL,
+		Timeout: 2 * time.Second,
+		Labels:  labels,
+	}
 	defer relays.Close()
 	speedControl := &speed.Controller{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}
 	defer speedControl.Close()
