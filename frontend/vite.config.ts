@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
+  '/healthz': 'http://localhost:8080',
   '/api': 'http://localhost:8080',
   '/metrics': 'http://localhost:8080',
   '/prometheus/api/v1/query': {

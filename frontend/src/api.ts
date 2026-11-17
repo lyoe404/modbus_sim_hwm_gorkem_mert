@@ -14,16 +14,31 @@ async function req<T>(path: string, token: string | null, init?: RequestInit): P
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
-  const res = await fetch(path, { ...init, headers });
+
+  // Bound stalled requests, including response-body reads, without losing cleanup cancellation.
+  const timeout = AbortSignal.timeout(10000);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  let res: Response;
+  try {
+    res = await fetch(path, { ...init, headers, signal });
+  } catch {
+    throw new ApiError(0, 'backend_unreachable'); // ağ hatası
+  }
+
   const text = await res.text();
   let data: any = null;
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
-    data = { error: text };
+    data = null; // HTML'i hata koduna çevirme
   }
+
   if (!res.ok) {
-    throw new ApiError(res.status, data?.error || `http_${res.status}`);
+    const gateway = [502, 503, 504].includes(res.status);
+    throw new ApiError(
+      res.status,
+      data?.error ?? (gateway ? 'backend_unreachable' : `http_${res.status}`),
+    );
   }
   return data as T;
 }
@@ -34,21 +49,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     }),
-  me: (token: string) => req<UserMe>('/api/auth/me', token),
-  devices: (token: string) => req<DeviceStatus[]>('/api/devices', token),
-  measurements: (token: string, source: string, metric: string, limit = 60) =>
-    req<MeasurementPoint[]>(`/api/measurements?source=${encodeURIComponent(source)}&metric=${encodeURIComponent(metric)}&limit=${limit}`, token),
-  relays: (token: string) => req<RelayChannel[]>('/api/relays', token),
+  health: (signal?: AbortSignal) => req<{ status: string }>('/healthz', null, { signal, cache: 'no-store' }),
+  me: (token: string, signal?: AbortSignal) => req<UserMe>('/api/auth/me', token, { signal }),
+  devices: (token: string, signal?: AbortSignal) => req<DeviceStatus[]>('/api/devices', token, { signal }),
+  measurements: (token: string, source: string, metric: string, limit = 60, signal?: AbortSignal) =>
+    req<MeasurementPoint[]>(`/api/measurements?source=${encodeURIComponent(source)}&metric=${encodeURIComponent(metric)}&limit=${limit}`, token, { signal }),
+  relays: (token: string, signal?: AbortSignal) => req<RelayChannel[]>('/api/relays', token, { signal }),
   setRelay: (token: string, id: number, on: boolean) =>
     req<RelayChannel>(`/api/relays/${id}`, token, {
       method: 'POST',
       body: JSON.stringify({ on }),
     }),
-  getControl: (token: string) => req<ControlSnapshot>('/api/config/control', token),
+  getControl: (token: string, signal?: AbortSignal) => req<ControlSnapshot>('/api/config/control', token, { signal }),
   putControl: (token: string, cfg: Partial<ControlConfig>) =>
     req<ControlSnapshot>('/api/config/control', token, {
       method: 'PUT',
       body: JSON.stringify(cfg),
     }),
-  events: (token: string, limit = 40) => req<AuditEvent[]>(`/api/events?limit=${limit}`, token),
+  events: (token: string, limit = 40, signal?: AbortSignal) => req<AuditEvent[]>(`/api/events?limit=${limit}`, token, { signal }),
 };

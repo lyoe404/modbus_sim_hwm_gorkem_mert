@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertTriangle, CheckCircle2, Cpu, ExternalLink, Lock, LogOut, Power, RefreshCw, Shield, Sliders } from 'lucide-react';
 import { api, ApiError } from './api';
+import { createPolling } from './polling';
 import { LiveChart } from './LiveChart';
 import { AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
 
@@ -48,20 +49,36 @@ export function App() {
     [me]
   );
 
-  // Load caller profile & capabilities
+  // Health is independent of device failures and caller capabilities.
+  useEffect(() => {
+    const polling = createPolling(async signal => {
+      try {
+        const health = await api.health(signal);
+        if (!signal.aborted) setBackendOffline(health?.status !== 'ok');
+      } catch {
+        if (!signal.aborted) setBackendOffline(true);
+      }
+    }, 2000);
+    return () => polling.stop();
+  }, []);
+
+  // Retry a transient profile failure; abandon responses from an old session.
   useEffect(() => {
     if (!token) return;
-    api
-      .me(token)
-      .then((u) => {
-        setMe(u);
+    const polling = createPolling(async signal => {
+      try {
+        const user = await api.me(token, signal);
+        if (signal.aborted) return;
+        setMe(user);
         setAuthError(null);
-      })
-      .catch((err) => {
-        if (err instanceof ApiError && err.status === 401) {
+        polling.stop();
+      } catch (err) {
+        if (!signal.aborted && err instanceof ApiError && err.status === 401) {
           logout(err.code === 'token_expired' ? 'Session expired. Please sign in again.' : 'Unauthorized session.');
         }
-      });
+      }
+    }, 2000);
+    return () => polling.stop();
   }, [token, logout]);
 
   useEffect(() => {
@@ -69,69 +86,85 @@ export function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  // Poll live telemetry & state
-  const pollAll = useCallback(async () => {
-    if (!token || !me) return;
-    try {
-      const tasks: Promise<void>[] = [];
+  const telemetryPolling = useRef<ReturnType<typeof createPolling> | null>(null);
+  const pollAll = useCallback(() => telemetryPolling.current?.run(), []);
 
-      if (hasPerm('read:device_status')) {
-        tasks.push(api.devices(token).then(setDevices));
-      }
-      if (hasPerm('read:sensor')) {
-        tasks.push(Promise.all([
-          api.measurements(token, 'sensor', 'temperature_c', 50),
-          api.measurements(token, 'sensor', 'humidity_pct', 50),
-        ]).then(([tempPoints, humidityPoints]) => {
-          setTemps(tempPoints);
-          setHumids(humidityPoints);
-          setSensorFetchFailed(false);
-        }).catch(err => {
-          setSensorFetchFailed(true);
-          if (err instanceof ApiError && err.status === 401) throw err;
-        }));
-      }
-      if (hasPerm('read:relay')) {
-        tasks.push(
-          api.relays(token).then((channels) => {
-            setRelays(channels); setRelayError(null);
-          }).catch((error) => {
-            setRelays([]); // never portray a stale coil state as an actual read-back
-            setRelayError(error instanceof ApiError ? error.code : 'relay_unreachable');
-            if (error instanceof ApiError && error.status === 401) throw error;
-          })
-        );
-      }
-      if (hasPerm('read:events')) {
-        tasks.push(api.events(token, 30).then(setEvents));
-        tasks.push(
-          api.getControl(token).then((snap) => {
-            setControl(snap);
-            setOnAboveInput((prev) => (document.activeElement?.id === 'on_above' ? prev : String(snap.config.on_above)));
-            setOffBelowInput((prev) => (document.activeElement?.id === 'off_below' ? prev : String(snap.config.off_below)));
-            setFanChInput((prev) => (document.activeElement?.id === 'fan_ch' ? prev : String(snap.config.fan_channel)));
-            setEnabledInput((prev) => (document.activeElement?.id === 'auto_enabled' ? prev : snap.config.enabled));
-          })
-        );
-      }
-
-      await Promise.all(tasks);
-      setBackendOffline(false);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        logout('Session expired. Please log in again.');
-        return;
-      }
-      setBackendOffline(true);
-    }
-  }, [token, me, hasPerm, logout]);
-
+  // Cleanup aborts the old session; manual refresh shares the scheduled cycle.
   useEffect(() => {
     if (!token || !me) return;
-    pollAll();
-    const id = setInterval(pollAll, 2000);
-    return () => clearInterval(id);
-  }, [token, me, pollAll]);
+    const polling = createPolling(async signal => {
+      try {
+        const tasks: Promise<void>[] = [];
+
+        if (hasPerm('read:device_status')) {
+          tasks.push(api.devices(token, signal).then(value => { if (!signal.aborted) setDevices(value); }));
+        }
+        if (hasPerm('read:sensor')) {
+          tasks.push(Promise.allSettled([
+            api.measurements(token, 'sensor', 'temperature_c', 50, signal),
+            api.measurements(token, 'sensor', 'humidity_pct', 50, signal),
+          ]).then(([temperature, humidity]) => {
+            if (signal.aborted) return;
+            const failures = [temperature, humidity].filter(result => result.status === 'rejected');
+            const failure = failures.find(result => result.reason instanceof ApiError && result.reason.status === 401) ?? failures[0];
+            if (failure) throw failure.reason;
+            if (temperature.status !== 'fulfilled' || humidity.status !== 'fulfilled') return;
+            setTemps(temperature.value);
+            setHumids(humidity.value);
+            setSensorFetchFailed(false);
+          }).catch(err => {
+            if (signal.aborted) return;
+            setSensorFetchFailed(true);
+            if (err instanceof ApiError && err.status === 401) throw err;
+          }));
+        }
+        if (hasPerm('read:relay')) {
+          tasks.push(
+            api.relays(token, signal).then((channels) => {
+              if (signal.aborted) return;
+              setRelays(channels); setRelayError(null);
+            }).catch((error) => {
+              if (signal.aborted) return;
+              setRelays([]); // never portray a stale coil state as an actual read-back
+              setRelayError(error instanceof ApiError ? error.code : 'relay_unreachable');
+              if (error instanceof ApiError && error.status === 401) throw error;
+            })
+          );
+        }
+        if (hasPerm('read:events')) {
+          tasks.push(api.events(token, 30, signal).then(value => { if (!signal.aborted) setEvents(value); }));
+          tasks.push(
+            api.getControl(token, signal).then((snap) => {
+              if (signal.aborted) return;
+              setControl(snap);
+              setOnAboveInput((prev) => (document.activeElement?.id === 'on_above' ? prev : String(snap.config.on_above)));
+              setOffBelowInput((prev) => (document.activeElement?.id === 'off_below' ? prev : String(snap.config.off_below)));
+              setFanChInput((prev) => (document.activeElement?.id === 'fan_ch' ? prev : String(snap.config.fan_channel)));
+              setEnabledInput((prev) => (document.activeElement?.id === 'auto_enabled' ? prev : snap.config.enabled));
+            })
+          );
+        }
+
+        // Wait for every endpoint, even when one fails early.
+        const results = await Promise.allSettled(tasks);
+        if (signal.aborted) return;
+        const unauthorized = results.find(result => result.status === 'rejected' &&
+          result.reason instanceof ApiError && result.reason.status === 401);
+        if (unauthorized?.status === 'rejected') throw unauthorized.reason;
+      } catch (err) {
+        if (signal.aborted) return;
+        if (err instanceof ApiError && err.status === 401) {
+          logout('Session expired. Please log in again.');
+          return;
+        }
+      }
+    }, 2000);
+    telemetryPolling.current = polling;
+    return () => {
+      telemetryPolling.current = null;
+      polling.stop();
+    };
+  }, [token, me, hasPerm, logout]);
 
   useEffect(() => {
     if (!token || !me || !hasPerm('read:sensor')) {
@@ -140,11 +173,11 @@ export function App() {
       return;
     }
 
-    let active = true;
-    const pollPrometheus = async () => {
+    const polling = createPolling(async signal => {
       try {
         const response = await fetch('/prometheus/api/v1/query?query=hwm_sensor_temperature_celsius', {
           cache: 'no-store',
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
         });
         if (!response.ok) throw new Error(`Prometheus HTTP ${response.status}`);
         const payload: {
@@ -156,23 +189,18 @@ export function App() {
         if (payload.status !== 'success' || !Number.isFinite(value)) {
           throw new Error('No current Prometheus temperature sample');
         }
-        if (active) {
+        if (!signal.aborted) {
           setPrometheusTemperature(value);
           setPrometheusError(null);
         }
       } catch (error) {
-        if (active) {
+        if (!signal.aborted) {
           setPrometheusTemperature(null);
           setPrometheusError(error instanceof Error ? error.message : 'Prometheus unavailable');
         }
       }
-    };
-    void pollPrometheus();
-    const timer = window.setInterval(() => void pollPrometheus(), 5000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
+    }, 5000);
+    return () => polling.stop();
   }, [token, me, hasPerm]);
 
   const handleLogin = async (e: React.FormEvent) => {
