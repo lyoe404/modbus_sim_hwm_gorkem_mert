@@ -90,9 +90,17 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("/api/devices", only(http.MethodGet, guard(auth.ReadDeviceStatus, s.devices)))
 	mux.Handle("/api/measurements", only(http.MethodGet, auth.Guard(s.Tokens)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		required := auth.ReadSensor
-		if strings.HasPrefix(r.URL.Query().Get("source"), "thermocouple") {
+		var required string
+		switch r.URL.Query().Get("source") {
+		case "", "sensor":
+			required = auth.ReadSensor
+		case "thermocouple_ch0", "thermocouple_ch1", "thermocouple_ch2", "thermocouple_ch3":
 			required = auth.ReadThermocouple
+		case "fan_speed":
+			required = auth.ReadFanSpeed
+		default:
+			writeErr(w, http.StatusBadRequest, "invalid_source")
+			return
 		}
 		claims, _ := auth.ClaimsFrom(r.Context())
 		for _, perm := range claims.Perms {

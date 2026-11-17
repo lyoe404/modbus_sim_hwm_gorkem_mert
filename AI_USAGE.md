@@ -1,51 +1,20 @@
-## Project: Industrial Hardware Monitoring & Control Platform
-## 1. AI Tools Used
+# AI tool usage disclosure
 
-**OpenAI ChatGPT** was used as a development assistant throughout selected stages of the project.
+Project: Industrial Hardware Monitoring & Control Platform (HWM Take-Home, v3.1)
+Disclosure required by brief §1.4.
 
-AI assistance was primarily used for technical research, architectural discussions, code review, debugging, test planning, and documentation.
+## Tools used
 
-## 2. Areas of AI Assistance
+| Tool | Where it was used |
+|---|---|
+| **Claude (Anthropic)** | Claude Code used as general coding assistant agent. ToolCode review of the backend; Dockerfiles, `docker-compose.yml` and `.env.example`; the `internal/control` hysteresis engine and its tests; the `config` table, the `/api/config/control` routes and their wiring in `cmd/backend`; small fixes (`errors.Is` in the auth guard, aligning the simulator Go version); a final read-through of the whole repository against the brief, which produced the gap list used to clean up this README. |
+| **OpenAI ChatGPT** | Architecture discussions (simulator / backend / frontend split, polling and backoff, graceful shutdown, JWT capabilities, SQLite audit log); debugging; test planning (relay read-back, hysteresis boundaries, Modbus timeout/garbage scenarios, race detector); drafting documentation. |
 
-### Architecture and Design
+## How AI output was handled
 
-AI was consulted to discuss architectural decisions and implementation approaches, including:
+- Generated code was read, modified and validated against the brief before being committed.
+- Where documentation written with AI help disagreed with the code, the code was treated as the source of truth and the documentation was corrected.
+- I can explain and extend any part of the running code in the technical discussion (§8.3), including adding a relay channel, a second hysteresis zone, or a new capability end to end.
 
-- Separation of Modbus device simulators, the Go backend, and the React frontend.
-- Polling strategies, concurrency management, and graceful shutdown.
-- Device fault handling, reconnection, and exponential backoff.
-- Hysteresis-based automatic control and manual override behavior.
-- JWT authentication and capability-based authorization.
-- SQLite persistence, audit logging, and device health monitoring.
 
-### Testing and Validation
-
-AI assisted in designing and reviewing automated tests and integration scenarios, including:
-
-- API authentication and authorization tests.
-- Relay switching and read-back verification.
-- Hysteresis boundary and transition tests.
-- Modbus timeout, malformed-response, and recovery scenarios.
-- Go race-detector testing.
-- Frontend build and Docker configuration validation.
-
-Tests were executed in the local development environment. Successful results were evaluated using the actual test outputs rather than relying solely on AI-generated expectations.
-
-### Documentation
-
-AI assistance was used to organize and improve project documentation, including:
-
-- README structure and technical explanations.
-- Architecture and component descriptions.
-- Setup and deployment instructions.
-- Core and Extended scope documentation.
-- Known limitations and testing instructions.
-- This AI usage disclosure.
-
-## 3. Developer Responsibility
-
-AI was used as a supporting tool, not as a substitute for engineering judgment.
-
-Responsibility for the project architecture, selected technologies, implementation decisions, integration, testing, and final submission remains with the developer.
-
-Generated suggestions were subject to review, modification, and validation against the project requirements.
+Core review follow-up: OpenAI Codex reviewed the supplied v3.1 assessment and corrected measurement-source capability enforcement, overlapping React polling, and backend health reporting. Added source authorization, polling cleanup/recovery, and health regression tests. Django and Extended device implementations were left unchanged.

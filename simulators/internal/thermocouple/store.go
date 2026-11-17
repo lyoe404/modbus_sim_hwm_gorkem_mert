@@ -98,13 +98,13 @@ func (s *Store) InputRegisters(addr, qty uint16) ([]uint16, bool) {
 
 func toReg(v float64) uint16 {
 	r := math.Round(v * 10)
-	if r < 0 {
-		return 0
+	if r < -32767 {
+		return 0x8001
 	}
 	if r > 0x7FFF {
 		return 0x7FFF
 	}
-	return uint16(r)
+	return uint16(int16(r))
 }
 
 func (s *Store) SetFault(m fault.Mode, delay time.Duration) {

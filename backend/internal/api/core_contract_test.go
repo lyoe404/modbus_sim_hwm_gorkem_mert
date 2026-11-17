@@ -3,6 +3,8 @@ package api
 import (
 	"backend/internal/auth"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +70,51 @@ func TestAutoFanRelayIsLockedWhileOtherCoilsRemainWritable(t *testing.T) {
 	rec = e.do("POST", "/api/relays/0", tok, `{"on":true}`)
 	if rec.Code != 200 {
 		t.Fatalf("manual-mode fan write: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// History access must use the capability of the exact requested source.
+func TestMeasurementSourceAuthorization(t *testing.T) {
+	e := newEnv(t)
+	sources := []string{"", "sensor", "thermocouple_ch0", "thermocouple_ch1", "thermocouple_ch2", "thermocouple_ch3", "fan_speed"}
+	for _, cap := range []string{auth.ReadSensor, auth.ReadThermocouple, auth.ReadFanSpeed, auth.ReadEvents} {
+		token, _, err := e.tokens.Issue("custom", "custom", []string{cap})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range sources {
+			required := auth.ReadThermocouple
+			if source == "" || source == "sensor" {
+				required = auth.ReadSensor
+			}
+			if source == "fan_speed" {
+				required = auth.ReadFanSpeed
+			}
+			want := 403
+			if cap == required {
+				want = 200
+			}
+			if got := e.do("GET", "/api/measurements?source="+source, token, "").Code; got != want {
+				t.Errorf("cap=%s source=%q: got %d want %d", cap, source, got, want)
+			}
+		}
+		for _, source := range []string{"unknown", "thermocouple", "thermocouple_ch4", "thermocouple_ch0_extra", "Sensor"} {
+			rec := e.do("GET", "/api/measurements?source="+source, token, "")
+			if rec.Code != 400 {
+				t.Errorf("unknown source %q: %d", source, rec.Code)
+			}
+		}
+	}
+	if got := e.do("GET", "/api/measurements?source=fan_speed", "", "").Code; got != 401 {
+		t.Errorf("unauthenticated history: %d", got)
+	}
+}
+
+func TestHealthIndependentOfDeviceFailures(t *testing.T) {
+	e := newEnv(t)
+	e.relays.err = errors.New("device offline")
+	rec := e.do("GET", "/healthz", "", "")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"status":"ok"`) {
+		t.Fatalf("health with offline device: %d %s", rec.Code, rec.Body)
 	}
 }

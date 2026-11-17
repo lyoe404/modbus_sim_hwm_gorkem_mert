@@ -1,409 +1,340 @@
 # Industrial Hardware Monitoring & Control Platform
 
-A full-stack industrial device monitoring and control platform built around a **Go backend**, **independent Modbus TCP simulators**, **React/TypeScript**, **SQLite**, **Prometheus**, and **Grafana**. The backend communicates with separate simulator processes over real TCP sockets, validates relay writes through physical read-back, applies temperature-driven hysteresis, and exposes capability-protected REST endpoints.
+A Go backend that polls independent Modbus TCP simulators over real sockets, persists readings, switches relays with read-back confirmation, applies temperature-driven hysteresis control, and gates everything behind capability-checked JWTs. A React UI, Prometheus and Grafana complete the stack, all started with one `docker compose up`.
 
-**Assessment:** Industrial Hardware Monitoring & Control — Technical Assessment v3.1  
-**Implementation scope:** Core implemented; Extended device integrations partially implemented. Django identity/authorization is not implemented.
+**Assessment:** Industrial Hardware Monitoring & Control, Technical Assessment v3.1
+**Scope delivered:** Core complete. Extended: simulators for thermocouple, PWM and remote reset exist, with partial backend support. The Django identity service (§2.11) is not built.
 
-> **Verification:** Core smoke, hysteresis, fault-recovery, and Go race tests were run successfully on a local Docker-based setup (reported on 2026-11-17). The source archive was subsequently reviewed, but the updated checkout was **not** independently rebuilt in this README-writing environment. Re-run the checks below after changing dependencies or Docker configuration.
+## 1. Scope
 
-## 1. Features and scope
+### Core (target scope)
 
-### Core
-
-| Requirement | Status | Implementation |
+| Brief item | Status | Notes |
 |---|---|---|
-| §2.1 Temperature/humidity sensor | Implemented and tested | Independent Modbus TCP simulator; bounded random walk; polling and SQLite history; fault injection and automatic recovery |
-| §2.2 Multi-channel relay controller | Implemented and tested | 8 coils, configurable labels, write/read-back verification, distinct failure responses |
-| §2.4 Go device backend | Implemented and tested | Layered packages, concurrent pollers, backoff, graceful shutdown, race-tested code |
-| §2.5 Automatic fan control | Implemented and tested | Runtime-configurable hysteresis, AUTO/MANUAL mode, coil reconciliation, audited transitions |
-| §2.7 React UI | Implemented | Live charts via 2-second polling, relay controls, threshold form, events, device-health/freshness states, capability gating |
-| §2.8 Prometheus + Grafana | Implemented and exercised | `/metrics`, Prometheus scraping, provisioned dashboard, Prometheus-backed value in React |
-| §2.10 JWT viewer/operator | Implemented and tested | Bcrypt passwords, environment-provided HS256 secret, per-route capability checks, 401/403 handling |
-| Mandatory Compose deployment | Configured and previously exercised | Separate services with `docker compose up --build`; reproduce from a clean checkout before submission |
+| §2.1 Temp/humidity sensor | Done | Separate Modbus TCP simulator, bounded random walk (18–35 °C, 30–80 %RH), polled every 2 s, persisted with timestamps, retry with backoff, visible connection status |
+| §2.2 Relay switching | Done | 8 coils, labels from config, write followed by read-back, distinct `write_failed` / `readback_failed` / `readback_mismatch` errors |
+| §2.4 Go backend | Done | Layered packages, one goroutine per device, context cancellation, clean shutdown, `go test -race` clean |
+| §2.5 Hysteresis fan control | Done | Two thresholds, runtime-editable, AUTO/MANUAL mode, coil reconciliation, every transition audited with its trigger value |
+| §2.7 React UI | Done | Login, live charts (2 s polling), relay controls, threshold form, event log, connection/freshness states, controls disabled per granted capability |
+| §2.8 Prometheus + Grafana | Done | `/metrics`, Prometheus scrape, provisioned dashboard, a Prometheus-sourced value shown in the UI |
+| §2.10 Auth baseline | Done | JWT, viewer/operator, bcrypt, signing key from environment, 401 vs 403, `token_expired` returns the UI to login |
+| §3 Mandatory platform | Done | One-command Compose, two-role JWT, Grafana with an importable dashboard JSON |
 
 ### Extended
 
-| Requirement | Status | Remaining work |
+| Brief item | Status | What exists / what is missing |
 |---|---|---|
-| §2.3 Thermocouple | Partial | Four-channel simulator, poller, SQLite history and read capability exist; channel-specific fault status needs explicit API/UI presentation |
-| §2.6 PWM fan speed | Partial | Simulator and read/write API exist; automatic speed curve, UI controls and visible feedback mismatch are incomplete |
-| §2.9 Remote reset | Partial | TCP reset simulator and recovery exist; authenticated Go reset endpoint, confirmation UI, audit and dependent-data unknown state remain |
-| §2.11 Django identity service | Not implemented | Django admin/user/grant models, RS256 issuance/refresh and Go public-key validation remain |
+| §2.3 Thermocouple | Partial | 4-channel simulator with per-channel `0x8000` fault, backend poller, SQLite history (`thermocouple_ch0..3`). **Missing:** channel fault state in the API and UI (a faulted channel is currently omitted from the data, not reported), UI panel, metrics |
+| §2.6 Variable fan speed | Partial | PWM simulator, `GET/POST /api/fan/speed` with read-back, command/feedback mismatch flag, audited writes, poller. **Missing:** temperature-to-speed curve, manual/auto speed mode, UI controls, mismatch shown in the UI |
+| §2.9 Remote reset | Partial | TCP reset simulator (`PING`, `STATUS`, `RESET <device>`, four targets, timed auto-recovery, tests). **Missing:** backend client and `POST /api/reset` guarded by `write:reset`, audit with the JWT username, UI confirmation, "unknown" marking of dependent data |
+| §2.11 Django identity service | Not built | See section 11 for the plan |
+| WebSocket / SSE | Not built | The UI polls; the brief accepts polling |
+| Bonus (alerts, RTU, config history, tracing, health score, presets) | Not built | Unit and integration tests exist; config changes are logged with old and new values in the event log |
 
-**Scope decision:** §2.11 is explicitly Extended in the brief. Core uses Go-issued HS256 JWTs with `viewer` and `operator` roles. Routes already evaluate capabilities from JWT claims rather than hard-coded role checks; this is not the same as having admin-managed capability grants.
+**Scope decision.** §2.11 is Extended and the brief says a clean §2.10 baseline is a complete Core submission. I prioritised a verified Core over spreading thin. Routes already check capabilities from JWT claims, not roles, so adding admin-managed grants later changes where `perms` comes from, not any route.
 
-## 2. Architecture
+## 2. Quick start
 
-```text
-                        React + TypeScript (Nginx)
-                      localhost:3000 (HTTP / REST)
-                                  |
-                                  v
-                   Go REST API + JWT authorization
-                            localhost:8080
-                    /healthz  /api/*  /metrics
-                     /              |           \
-                    v               v            v
-             Pollers +          Hysteresis      SQLite
-             health state       control engine  (volume)
-                  |                  |
-                  +------------------+
-                             Modbus TCP
-                                  |
-               +------------------+------------------+
-               |                  |                  |
-       Temp/Humidity:5021     Relay:5022      Thermocouple:5023
-                                                  + PWM:5024
-
-         Prometheus:9090  --> scrapes /metrics --> Grafana:3001
-
-         Remote reset TCP simulator:9001 (Extended infrastructure only)
-```
-
-Each device simulator runs as a **separate service/process**. Go uses real Modbus TCP operations; sensor readings are not generated in the backend process. The remote-reset simulator is independent, but its API/UI integration is unfinished.
-
-### Repository layout
-
-```text
-backend/
-  cmd/backend/          bootstrap, runtime wiring, shutdown
-  internal/api/         REST handlers, metric exposition, authorization boundaries
-  internal/auth/        login, bcrypt users, JWT, capability catalog
-  internal/control/     hysteresis, mode handling, audit, safety
-  internal/poller/      Modbus readers, retry/backoff, health status
-  internal/relay/       relay writes, read-back, reconciliation
-  internal/speed/       PWM speed Modbus controller (Extended)
-  internal/store/       SQLite measurements, events, config, device_states
-  internal/envfile/     optional environment loading
-simulators/
-  cmd/                  five simulator entry points
-  internal/             temp/humidity, relay, thermocouple, PWM, reset, faults
-frontend/
-  src/                  React/TypeScript UI
-  Dockerfile            Vite build + Nginx runtime
-observability/
-  prometheus/           scrape configuration
-  grafana/              datasource/dashboard provisioning and dashboard JSON
-scripts/
-  smoke_test.py
-  hysteresis_integration.py
-  fault_recovery_integration.py
-  race_tests.ps1
-.env.example
-AI_USAGE.md
-README.md
-```
-
-## 3. Requirements
-
-- Docker Engine + Docker Compose (Docker Desktop on Windows is supported).
-- Free host ports: frontend `3000`, backend `8080`, Prometheus `9090`, Grafana `3001`, and simulator admin `5121`–`5124` / TCP reset `9001`, unless changed in Compose.
-- Python 3 for integration tests (scripts use the Python standard library).
-- Go toolchain only for running Go tests locally; the application is built inside Docker.
-- Node.js/npm only for local frontend development; not necessary to run the Compose stack.
-
-## 4. Quick start
-
-### Configure environment
-
-macOS/Linux:
+Requirements: Docker with Compose. Python 3 is only needed for the integration scripts, Go only for running tests outside Docker.
 
 ```bash
-cp .env.example .env
-```
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Edit `.env` and set **unique local values** for `JWT_SECRET` (minimum 32 characters), `VIEWER_PASSWORD` and `OPERATOR_PASSWORD` (minimum 8 characters). The example file documents the variables; do not commit the populated `.env`.
-
-> **Current archived Compose configuration:** Grafana uses `GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}`. Set `GRAFANA_PASSWORD` in your `.env` before running and preferably change Compose to `${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}` to eliminate the insecure fallback. Add `GRAFANA_PASSWORD=` to `.env.example` when making this change.
-
-### Start the stack
-
-```bash
+cp .env.example .env          # Windows PowerShell: Copy-Item .env.example .env
 docker compose up --build -d
 docker compose ps
-```
-
-Check backend health:
-
-```bash
 curl http://localhost:8080/healthz
 ```
 
-View logs or stop:
+Stop with `docker compose down`; add `-v` to also delete the database and monitoring volumes.
 
-```bash
-docker compose logs -f backend
-docker compose down
-```
-
-To remove persisted database and monitoring data **as well** (destructive):
-
-```bash
-docker compose down -v
-```
-
-### Endpoints
-
-| Service | Address | Notes |
+| Service | URL | Notes |
 |---|---|---|
-| React UI | http://localhost:3000 | Main application |
-| Go API | http://localhost:8080 | `/healthz`, authenticated `/api/*` |
-| Prometheus | http://localhost:9090 | Scrapes backend `/metrics` |
-| Grafana | http://localhost:3001 | Provisioned dashboard |
-| Sensor simulator admin | http://127.0.0.1:5121 | Fault and temperature control, **local testing only** |
-| Relay simulator admin | http://127.0.0.1:5122 | Simulator state, **local testing only** |
-| Thermocouple simulator admin | http://127.0.0.1:5123 | Extended simulator |
-| PWM simulator admin | http://127.0.0.1:5124 | Extended simulator |
-| Remote reset TCP simulator | 127.0.0.1:9001 | TCP command service, not HTTP |
+| React UI | http://localhost:3000 | Nginx serves the UI and proxies `/api/` to the backend |
+| Go API | http://localhost:8080 | `/healthz` and `/metrics` are unauthenticated, `/api/*` needs a JWT |
+| Prometheus | http://localhost:9090 | Scrapes the backend every 2 s |
+| Grafana | http://localhost:3001 | Dashboard "Industrial Hardware Monitoring & Control" is provisioned |
+| Sensor simulator admin | http://127.0.0.1:5121 | Fault injection, temperature pinning. Loopback only |
+| Relay / thermocouple / PWM admin | http://127.0.0.1:5122 / 5123 / 5124 | Loopback only |
+| Remote reset simulator | 127.0.0.1:9001 | Raw TCP text protocol |
 
-The Modbus endpoints `5021`–`5024` are reachable **inside the Compose network** and are not published to the host.
+Modbus ports 5021–5024 exist only inside the Compose network.
 
-### Test accounts
+### Test logins
 
-The identities are created by the Go backend from your **local `.env`** at startup:
+Accounts are created at startup from `.env`. With the values in `.env.example`:
 
-| Role | Default username | Password source | Effective permissions |
+| Role | Username | Password | Capabilities |
 |---|---|---|---|
-| Viewer | `viewer` | `VIEWER_PASSWORD` | All `read:*`, no `write:*` |
-| Operator | `operator` | `OPERATOR_PASSWORD` | All defined `read:*` and `write:*` claims |
+| Viewer | `viewer` | `viewer-dev-pass` | all `read:*`, no `write:*` |
+| Operator | `operator` | `operator-dev-pass` | all `read:*` and all `write:*` |
+| Grafana | `admin` | `example-pass` (`GRAFANA_PASSWORD`) | Grafana admin |
 
-`VIEWER_USERNAME` and `OPERATOR_USERNAME` can override the names. **Do not use sample development passwords outside a local test environment.** Having a `write:reset` claim does not mean the unfinished `/api/reset` endpoint exists.
+These are development placeholders, not secrets. Change them in `.env` for anything beyond a local demo. `.env` is git-ignored; `.env.example` lists every required variable.
 
-## 5. Modbus register map
+### Smoke test (reviewer path)
 
-The mapping below describes **this implementation**, not the brief's optional example register addresses. See `simulators/internal/*/registers.go` for source definitions.
+```bash
+TOKEN=$(curl -s localhost:8080/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"operator","password":"operator-dev-pass"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
 
-| Device | Service | Modbus object | Address | Meaning |
+curl -s localhost:8080/api/devices -H "Authorization: Bearer $TOKEN"
+curl -s -X POST localhost:8080/api/relays/3 -H "Authorization: Bearer $TOKEN" -d '{"on":true}'   # 200, read-back state
+```
+
+Repeat the relay call with the viewer's token: `403`. An operator write to the AUTO-controlled fan channel (CH0) returns `409`; other channels stay writable.
+
+## 3. Architecture
+
+```
+                 React + TypeScript (Nginx :3000)
+                              |  REST (polling)
+                              v
+        Go backend :8080  (REST, JWT capability guard, /metrics)
+        pollers (goroutine per device) | control engine | SQLite
+                              |  Modbus TCP
+     +-----------+------------+------------+-----------+
+  sensor:5021  relay:5022  thermocouple:5023  pwm:5024      reset TCP :9001
+     (separate simulator processes, own Go module)
+
+        Prometheus :9090 --scrapes /metrics--> Grafana :3001
+```
+
+```
+backend/
+  cmd/backend/       wiring, config from env, graceful shutdown
+  internal/poller/   one goroutine per device; backoff + jitter; online/degraded/offline
+  internal/relay/    coil write + read-back; distinct error kinds
+  internal/control/  pure hysteresis rule + Engine (runtime config, safety rules, audit)
+  internal/speed/    PWM Modbus client (Extended)
+  internal/store/    SQLite: measurements, events, device_states, config
+  internal/auth/     JWT issue/verify, bcrypt users, capability catalog, Guard middleware
+  internal/api/      REST routes (each guarded by its own capability), /metrics
+  internal/envfile/  optional .env loader (real environment wins)
+simulators/          cmd/{temp-humidity,relay,thermocouple,speed-pwm,remote-reset}-sim, internal/*
+frontend/            React + Vite + Tailwind, served by Nginx
+observability/       Prometheus config, Grafana provisioning and dashboard JSON
+scripts/             smoke_test.py, hysteresis_integration.py, fault_recovery_integration.py, race_tests.ps1
+```
+
+### Design decisions
+
+- **Go `net/http` with the standard mux, no framework.** The route table is small and the capability guard is about 30 lines, so a framework adds nothing.
+- **SQLite (`modernc.org/sqlite`, pure Go) instead of Postgres/Timescale.** One file, no cgo, trivial in Docker. A single connection with WAL and `busy_timeout` avoids writer contention. Four tables keep concerns separate: `measurements`, `events` (audit), `device_states`, `config`.
+- **HS256 shared secret instead of RS256.** The brief allows this simplification. It is sufficient while the Go backend issues its own tokens. With a Django issuer it should become RS256 so the backend holds only the public key.
+- **Capabilities, not roles.** Every route requires specific capabilities from the token's `perms` claim. A role is shorthand that `auth.PermsForRole` expands to a list.
+- **401 vs 403.** Missing, invalid or expired token: 401 (expired uses the distinct code `token_expired`). Valid token without the capability: 403. Only HS256 is accepted, so `alg: none` is rejected (tested).
+- **Login hardening.** bcrypt; unknown usernames are compared against a dummy hash so timing does not reveal which users exist.
+- **REST polling instead of WebSocket/SSE.** Allowed by the brief; keeps the UI simple. A reading is shown as LIVE only if the sensor is online and the latest sample is recent.
+- **Relay honesty.** `POST /api/relays/{id}` writes the coil, then reads it back. The UI renders the read-back, never the command, and clears relay state when the read fails.
+- **Real protocol.** The backend speaks Modbus TCP to simulator processes over sockets. Nothing is generated in-process.
+
+Shutdown order: SIGINT/SIGTERM cancels the context, pollers, engine and HTTP server stop, and only then does the database close.
+
+## 4. Modbus register map
+
+Defined in `simulators/internal/*/registers.go` (single source of truth). This is this implementation's map, not the brief's suggested one.
+
+| Device | Service | Object | Address | Meaning |
 |---|---|---|---|---|
-| Temp/humidity | `temp-humidity-sim:5021` | Input register, FC4 | 0 | Temperature, °C × 10 |
-| Temp/humidity | `temp-humidity-sim:5021` | Input register, FC4 | 1 | Relative humidity, % × 10 |
-| Relay | `relay-sim:5022` | Coil, FC1/FC5 (FC15 fallback) | 0–7 | Eight independently controlled loads |
-| Thermocouple | `thermocouple-sim:5023` | Input register, FC4 | 0–3 | Channels CH0–CH3, °C × 10 |
-| Thermocouple | `thermocouple-sim:5023` | Input-register sentinel | `0x8000` | Channel fault/open circuit |
-| PWM | `speed-pwm-sim:5024` | Holding register, FC3/FC6 | 0 | Speed command, 0–100% |
-| PWM | `speed-pwm-sim:5024` | Holding register, FC3 | 1 | Tachometer feedback, 0–3000 RPM nominal |
+| Temp/humidity | `:5021` | Input reg (FC4) | 0 | Temperature, °C × 10 |
+| Temp/humidity | `:5021` | Input reg (FC4) | 1 | Humidity, % × 10 |
+| Relay | `:5022` | Coil (FC1 read, FC5 write, FC15 fallback) | 0–7 | Channels 0–7 on/off |
+| Thermocouple | `:5023` | Input reg (FC4) | 0–3 | Channels 0–3, °C × 10 |
+| Thermocouple | `:5023` | Sentinel | `0x8000` | Channel fault / open circuit |
+| PWM | `:5024` | Holding reg (FC3/FC6) | 0 | Speed command, 0–100 % |
+| PWM | `:5024` | Holding reg (FC3) | 1 | Tachometer feedback, RPM (nominal 30 RPM per %) |
 
-Temperature and humidity simulator values follow bounded random walks; the ambient ranges are approximately **18–35 °C** and **30–80% RH**.
+Relay labels default to `Fan 1, Heater, Lighting, Aux Power, Channel 5..8`. Set `RELAY_LABELS_FILE` to a JSON array (1–8 strings) to rename channels with no code change.
 
-Relay labels are loaded from `RELAY_LABELS_FILE` (JSON array) if configured. Default labels cover Fan 1, Heater, Lighting, Aux Power and additional channels. Renaming does not require editing controller logic.
+## 5. API and capabilities
 
-## 6. Authentication and API
+| Method | Path | Capability |
+|---|---|---|
+| POST | `/api/auth/login` | public |
+| GET | `/api/auth/me` | any valid token |
+| GET | `/api/devices` | `read:device_status` |
+| GET | `/api/measurements?source=&metric=&since=&limit=` | `read:sensor` (`read:thermocouple` for `thermocouple_ch0..3`, `read:fan_speed` for `fan_speed`; unknown sources return 400) |
+| GET | `/api/relays` | `read:relay` |
+| POST | `/api/relays/{id}` body `{"on":bool}` | `write:relay` |
+| GET | `/api/events?limit=` | `read:events` |
+| GET | `/api/config/control` | `read:events` |
+| PUT | `/api/config/control` | `write:thresholds` |
+| GET | `/api/fan/speed` | `read:fan_speed` (Extended) |
+| POST | `/api/fan/speed` body `{"percent":0..100}` | `write:fan_speed` (Extended) |
+| GET | `/healthz`, `/metrics` | public |
 
-Authentication uses bearer JWTs signed with an environment-provided **HS256** secret and one-hour expiration. Passwords are hashed with bcrypt. Go checks permissions on each route; lack of authentication yields **401**, whereas a valid token without the required permission yields **403**.
+Catalog (flat; no capability implies another): `read:sensor`, `read:relay`, `read:thermocouple`, `read:fan_speed`, `read:events`, `read:device_status`, `write:relay`, `write:fan_speed`, `write:thresholds`, `write:reset`.
 
-| Method | Endpoint | Required capability | Purpose |
-|---|---|---|---|
-| POST | `/api/auth/login` | Public | Username/password to JWT |
-| GET | `/api/auth/me` | Valid JWT | Identity, role and capabilities |
-| GET | `/api/devices` | `read:device_status` | Live poller status |
-| GET | `/api/measurements` | `read:sensor` or `read:thermocouple` depending on source | Historical series |
-| GET | `/api/relays` | `read:relay` | Live coil state and labels |
-| POST | `/api/relays/{id}` | `write:relay` | Coil write and confirmed read-back |
-| GET | `/api/events` | `read:events` | Audit/event history |
-| GET | `/api/config/control` | `read:events` | Control settings and mode |
-| PUT | `/api/config/control` | `write:thresholds` | Update control thresholds/mode |
-| GET | `/api/fan/speed` | `read:fan_speed` | PWM command and feedback (Extended API) |
-| POST | `/api/fan/speed` | `write:fan_speed` | Set manual PWM command (Extended API) |
-| GET | `/healthz` | Public | Backend HTTP health |
-| GET | `/metrics` | Public | Prometheus exposition |
+`write:reset` is defined, but `/api/reset` does not exist yet.
 
-**Not implemented:** `/api/reset`, Django `/api/auth/refresh`, WebSocket/SSE. The current frontend uses periodic REST polling (accepted by the assessment).
+## 6. Fan control and safety
 
-Capability catalog: `read:sensor`, `read:relay`, `read:thermocouple`, `read:fan_speed`, `read:events`, `read:device_status`, `write:relay`, `write:fan_speed`, `write:thresholds`, `write:reset`.
+Genuine two-threshold hysteresis (`internal/control`): turn ON when `temp > on_above`, turn OFF when `temp < off_below`, hold inside the band. Defaults 30 / 27 °C. Example: 28 (off) → 31 (on) → 29 (stays on) → 26 (off) gives exactly one on and one off event.
 
-### Example API calls
+- **Runtime configuration.** Thresholds, fan channel and mode live in the SQLite `config` table, are validated (`on_above > off_below`, plausible range, existing channel), saved before being applied, and take effect on the next reading with no restart. Each change is an audited `config_change` event with old and new values and the acting user.
+- **AUTO / MANUAL.** `enabled=true` is AUTO: the fan relay is locked and writes to it return `409`. `enabled=false` is MANUAL: operators with `write:relay` can switch it. Other channels are always writable. Mode switches are audited.
+- **Hardware truth before a decision.** On every fresh reading the engine reads the fan coil back over Modbus. If that read fails, control suspends instead of assuming a state.
+- **Stale or bad data.** A reading older than three polls, or outside −40..125 °C, suspends control (`control_suspended`); the next good reading writes `control_resumed`. The fan holds its last state while suspended. This is a deliberate choice, not a hardware fail-safe.
+- **Confirmed state only.** The engine's belief about the fan changes only after the relay layer's read-back confirmed the write. A failed write is retried on the next reading and logged once per outage (`fan_actuation_failed`).
+- **Non-blocking.** The poller hands readings to the engine through a one-slot "newest wins" channel, so a slow relay write never blocks polling.
 
-Log in:
+Event kinds: `status_change`, `relay_write`, `fan_speed_write`, `fan_transition`, `fan_sync`, `fan_actuation_failed`, `control_suspended`, `control_resumed`, `config_change`, `control_mode_change`.
 
-```bash
-curl -X POST http://localhost:8080/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"operator","password":"<YOUR_OPERATOR_PASSWORD>"}'
-```
+## 7. Persistence and observability
 
-Copy the returned `token` into `TOKEN` (shell environment variable). Then:
-
-```bash
-curl http://localhost:8080/api/devices -H "Authorization: Bearer $TOKEN"
-curl http://localhost:8080/api/relays -H "Authorization: Bearer $TOKEN"
-curl http://localhost:8080/api/events -H "Authorization: Bearer $TOKEN"
-
-# Control an auxiliary coil (channel 3; does not conflict with AUTO Fan 1)
-curl -X POST http://localhost:8080/api/relays/3 \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"on":true}'
-```
-
-With a viewer JWT, the relay write must return `403`. With the fan configured in AUTO mode, an operator write to its controlled coil (default CH0) must return `409 Conflict`; other coils remain writable.
-
-## 7. Automatic fan control and safety
-
-The control engine uses true two-threshold hysteresis:
-
-- Turn **ON** when temperature is strictly greater than `on_above`.
-- Turn **OFF** when temperature is strictly lower than `off_below`.
-- Inside the band, preserve the current relay state.
-
-Example: `on_above = 30`, `off_below = 27` yields `28°C OFF → 31°C ON → 29°C ON → 26°C OFF` when starting OFF.
-
-Control configuration is stored in SQLite's `config` table and can be edited at runtime via the capability-gated API/UI. `enabled = true` means **AUTO**; `enabled = false` means **MANUAL**. In AUTO, writes to the selected fan relay are blocked to avoid conflicting controllers. On each valid sensor update the engine reconciles the physical fan coil state before making a decision.
-
-If measurements are stale, implausible or unavailable, the controller suspends automated decisions and **holds the last fan state**. This is an explicit design decision, not a hardware fail-safe guarantee. The engine writes audited `fan_transition`, `fan_sync`, `control_suspended`, `control_resumed`, `fan_actuation_failed`, `config_change` and `control_mode_change` events as applicable.
-
-## 8. Persistence and observability
-
-The backend uses `modernc.org/sqlite` (pure Go, no CGO dependency), with WAL and a single database connection. The `backend-data` named Docker volume persists data across ordinary container restarts.
-
-| SQLite table | Purpose |
+| Table | Purpose |
 |---|---|
-| `measurements` | Timestamped metric history, by source and metric |
-| `events` | State transitions and user-action audit records |
-| `device_states` | Last persisted status, last-seen time, error and consecutive failures |
-| `config` | Runtime control configuration, modification timestamp and actor |
+| `measurements` | Timestamped history by source and metric |
+| `events` | Audit log (relay writes with username, state changes, control events) |
+| `device_states` | Last observed status, last seen, error, failures. Not trusted after restart: live pollers start as `unknown` |
+| `config` | Runtime control configuration with updated time and actor |
 
-Historical `device_states` rows are **not** trusted as current truth after restart. The live pollers start in `unknown` and report actual device status as they observe it.
+`/metrics` exports: `hwm_device_online`, `hwm_device_consecutive_failures`, `hwm_sensor_temperature_celsius`, `hwm_sensor_humidity_percent`, `hwm_relay_channel_state`, `hwm_control_threshold_celsius`, `hwm_control_suspended`. Sensor gauges are omitted when the sensor is offline or the sample is older than 15 s; use `hwm_device_online` to tell absence from zero.
 
-The backend exports Prometheus text metrics at `/metrics`; Prometheus scrapes the backend and Grafana provisions a dashboard from `observability/grafana/dashboards/industrial_dashboard.json`. The React UI includes a Prometheus-backed metric and a Grafana dashboard link. The Grafana URL is compiled using the `VITE_GRAFANA_PORT` build argument, supplied from Compose `GRAFANA_PORT`; rebuild the frontend after changing that port.
+Prometheus scrapes the backend. Grafana provisions `observability/grafana/dashboards/industrial_dashboard.json` (7 panels: connectivity, temperature, humidity, control loop, temperature with hysteresis band, humidity, relay states). The UI shows the temperature as queried from Prometheus (through Nginx's read-only `/prometheus/api/v1/query` proxy) and links to the Grafana dashboard. The link's port comes from `GRAFANA_PORT` at frontend build time, so rebuild the frontend after changing it.
 
-## 9. Fault injection and recovery
+## 8. Fault injection
 
-**Development/testing only.** Simulator admin HTTP endpoints intentionally lack authentication and are exposed on host loopback by Compose. Do not publish them outside a trusted local environment.
+Test tools only: simulator admin endpoints are unauthenticated and published on host loopback.
 
 ```bash
-# Simulated loss of communication
-curl -X POST 'http://localhost:5121/fault?mode=down'
-
-# Restore normal communications
-curl -X POST 'http://localhost:5121/fault?mode=none'
-
-# Pin temperature; restore random walk after the test
-curl -X POST 'http://localhost:5121/temp?value=31'
-curl -X POST 'http://localhost:5121/temp?value=auto'
+curl -X POST 'localhost:5121/fault?mode=down'     # none | slow | timeout | error | garbage | down  [&delay=3s]
+curl -X POST 'localhost:5121/temp?value=31'       # pin temperature; value=auto resumes the random walk
+curl -X POST 'localhost:5121/fault?mode=none'     # recover
 ```
 
-Supported sensor fault modes include `none`, `slow`, `timeout`, `error`, `garbage` and `down`. During a fault the Go backend should stay responsive, transition device status through degraded/offline as configured, preserve honest last-seen information, omit unconfirmed measurements, and recover once the simulator does.
+`GET /api/devices` goes `online` → `degraded` → `offline` and recovers by itself. The backend stays up and every state change is written to the event log. To drive the hysteresis band: `for t in 25 28 31 29 26; do curl -s -X POST "localhost:5121/temp?value=$t" >/dev/null; sleep 3; done`, then read `/api/events`.
 
-## 10. Tests and verification
-
-### Integration tests (start Compose first)
+## 9. Tests and verification
 
 ```bash
+cd backend    && go test -race ./...
+cd simulators && go test -race ./...
+# Windows with Docker Desktop (Go 1.26 in a Linux container):
+powershell -ExecutionPolicy Bypass -File scripts/race_tests.ps1
+
+# with the stack running:
 python scripts/smoke_test.py
 python scripts/hysteresis_integration.py
-python scripts/fault_recovery_integration.py
+python scripts/fault_recovery_integration.py      # --max-wait 150 on slow machines
 ```
 
-`smoke_test.py` checks HTTP health, login, viewer write denial, devices, measurements, relay read-back, control config and events. `hysteresis_integration.py` drives real simulated temperature changes, verifies ON/OFF transitions and event logging, and restores the original mode and pinned temperature. `fault_recovery_integration.py` tests timeout and malformed responses, backend survival, offline Prometheus state, last-seen integrity, and recovery; use `--max-wait 150` on slow machines if necessary.
+The integration scripts change simulator behaviour: run them only on a local test stack.
 
-These tests change simulator behavior; run only on a local test stack.
+Results on my local Docker stack (2026-11-17):
 
-### Go tests and race detector
-
-From the project root, with Go available:
-
-```bash
-cd backend
-go test ./...
-go test -race ./...
-
-cd ../simulators
-go test ./...
-go test -race ./...
-```
-
-Windows Docker Desktop (Linux containers):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/race_tests.ps1
-```
-
-The Windows script executes race-enabled tests in a Linux/amd64 Go container. A clean `-race` run covers exercised concurrency paths; it does not guarantee the absence of every possible race or device fault.
-
-### Verification record
-
-The following checks were **reported passing on a local Docker stack on 2026-11-17**:
-
-| Check | Recorded result |
+| Check | Result |
 |---|---|
-| Core HTTP smoke | PASS |
-| Temperature hysteresis: OFF → ON → hold → OFF | PASS; exactly one ON and one OFF audit event |
-| Simulated service disconnection and restart | Backend remained operational, status recovered |
-| Fault recovery (`timeout`, `garbage`) | PASS; no fabricated successful sensor sample or incorrect `last_seen` update |
-| Go backend `-race` suite | PASS |
-| Go simulator `-race` suite | PASS |
-| Frontend `npm ci` and `npm run build` | PASS, reported subsequently |
+| `go test -race ./...` in `backend` and `simulators` (Go 1.26) | PASS, no race reports |
+| `scripts/smoke_test.py` | PASS |
+| `scripts/hysteresis_integration.py` | PASS: exactly one audited ON and one OFF |
+| `scripts/fault_recovery_integration.py` (`timeout`, `garbage`) | PASS: backend stayed healthy, sensor went offline and recovered, `last_seen` not falsely updated |
+| Frontend `npm ci` + `npm run build` | PASS |
 
-After lockfile/Dockerfile changes, rerun `docker compose build frontend` (and then `docker compose up -d`) from a clean checkout. The latest dependency audit also reported Vite/esbuild development-tool vulnerabilities; evaluate them separately from the runtime image, and do not claim the npm audit is clean until retested.
+Covered by tests: capability checks per route, `alg: none` rejection, relay failure kinds, hysteresis sweep, stale/implausible data, runtime config, failed-write retry, backoff and state transitions, store, simulator register behaviour and remote-reset recovery. A clean `-race` run covers the exercised paths only. Packages without tests: `cmd/backend` (wiring) and `internal/speed`.
 
-## 11. Frontend development and builds
+## 10. Known limitations
+
+- **`/api/measurements` capability mapping is incomplete.** Only `thermocouple*` sources need their own capability; `source=fan_speed` is readable with `read:sensor`, and unknown sources are not rejected. It should map every source to its read capability and reject the rest.
+- **`suspended` flag outlives AUTO.** If control is suspended and the operator switches to MANUAL, the flag (and `hwm_control_suspended`) stays set until AUTO resumes with a fresh reading.
+- **Unbounded `measurements`.** About 86k rows per day per series at 2 s. No retention or downsampling job.
+- **No login rate limiting.** Failed-login usernames are logged verbatim.
+- **No token refresh.** The TTL is one hour; the UI returns to login on `token_expired`. Capability changes would apply only at the next login, and there is no revocation before expiry.
+- **Modbus client calls do not take a context.** A relay write (connect, write, read-back) can take about three client timeouts, longer than the API's 5 s deadline.
+- **Config update and its audit event are two separate SQL operations**, not one transaction.
+- **A fan with no fresh data keeps its last state.** There is no independent hardware interlock.
+- **Simulator admin APIs have no authentication.** They are test tools bound to loopback.
+- **The UI stores the JWT in `localStorage`**, which is simple but exposed to XSS.
+
+## 11. Cuts and how I would finish them
+
+I stopped at a verified Core, as the brief recommends. In the order I would do them:
+
+1. **Thermocouple fault state.** Return per-channel `{value, fault}` from the poller instead of dropping faulted channels, expose it on a read endpoint guarded by `read:thermocouple`, add a UI panel and a metric.
+2. **Remote reset.** Backend client for the TCP service, `POST /api/reset` guarded by `write:reset`, audit event with the JWT username, a confirmation dialog in the UI, and marking the target device's data `unknown` until it recovers.
+3. **Variable fan speed.** Implement the linear curve (20 % at 25 °C to 100 % at 35 °C, clamped) behind a manual/auto speed mode, add UI controls, and show command-versus-feedback mismatch.
+4. **Django identity service (§2.11).** Django 5 + DRF + simplejwt with RS256. Models: `User` and an append-only `CapabilityGrant` (who granted, when, revoked_at and revoked_by). Capabilities become data edited in the Django admin. The token carries the resolved `perms`, and the Go backend verifies it locally with the public key only. The route guards stay as they are; only the token verifier changes from HS256 to RS256. Separate database and Compose service. Django must not poll devices or run control logic.
+
+## 12. Frontend development
 
 ```bash
 cd frontend
 npm ci
-npm run dev
+npm run dev        # Vite dev server
+npm run build      # tsc + vite build
 ```
 
-Production assets:
+The Docker build uses `package-lock.json` and `npm ci`. `frontend/node_modules/` and `frontend/dist/` are git-ignored.
 
-```bash
-npm run build
+## 13. AI usage
+
+See [`AI_USAGE.md`](AI_USAGE.md).
+### Core correctness checks
+
+The UI checks backend liveness through `/healthz` independently of device endpoints and permissions. Device failures do not mark the backend offline. Vite and Nginx proxy this route to Go. Polling shares one active cycle across timer ticks and manual refreshes, waits for all endpoint requests, and aborts on cleanup; requests time out after 10 seconds. Profile loading retries transient failures.
+
+Run frontend regression tests with `cd frontend && npm ci && npm test`, then `npm run build`. Run backend tests with `cd backend && go test ./...`; race checks require a supported 64-bit Go toolchain and C compiler (`go test -race ./...`).
+
+
+## Extended implementation (?2.3, ?2.6, ?2.9)
+
+The existing Go/JWT viewer and operator architecture is retained. Device values come
+from independent Modbus TCP simulators; reset commands use the raw TCP reset service.
+
+| Endpoint | Capability | Contract |
+| --- | --- | --- |
+| GET /api/thermocouple | read:thermocouple | `channels[4]` with source, status (`live`, `fault`, `unknown`), nullable `temperature_c`, `last_valid_at`; `all_channels_faulted` |
+| GET /api/fan/speed | read:fan_speed | verified `command_pct`, `feedback_rpm`, sustained `mismatch` |
+| POST /api/fan/speed | write:fan_speed | `{ "percent": 0..100 }`; AUTO returns 409; device/read-back failures return 502 |
+| POST /api/reset | write:reset | `{ "target": "relay" }`; 202 initiated; invalid target 400; unavailable 503; TCP failure 502 or context timeout 504 |
+
+Thermocouple FC4 input registers 0?3 contain signed int16 tenths of a degree.
+`0x8000` exclusively denotes channel fault; `0xffff` represents ?0.1?C.
+Valid temperatures span ?200 through 1300?C. A fault omits the sample from history,
+clears the current value and preserves the last-valid timestamp. Even four probe
+faults leave the transport online. Connection failures/reset make channels unknown.
+Current channel snapshots expire after six seconds without a successful poll.
+
+PWM FC3 holding register 0 is command percent (FC6 writable); register 1 is actual
+feedback RPM (0?3000). AUTO preserves relay hysteresis and uses confirmed relay
+feedback: OFF commands zero, ON uses `clamp(round(20 + (T?25)*8), 0, 100)`.
+Only fresh plausible ambient samples authorize automatic actions. MANUAL permits
+operator commands. Mode changes, manual commands, automatic steps and reset
+invalidation share the engine operation mutex. Commands require read-back.
+RPM error over 300 RPM must persist for five seconds, after a five-second command
+settling period, before mismatch is reported. Automatic write transitions and
+failure/recovery edges are audited instead of every poll.
+
+Reset accepts exactly `temp-humidity`, `relay`, `thermocouple`, `speed-pwm`.
+Configure `RESET_TCP_ADDR` (Compose: `remote-reset-sim:9001`); each TCP operation
+has a four-second timeout and request cancellation closes its connection. The API
+never calls simulator admin HTTP for reset. Attempts and initiation/failure results
+include the JWT username and timestamp in audit events. During reset, telemetry is
+invalidated and pollers expose `recovering`, `offline`, `unknown`, or
+`recovery_failed` as reported by the TCP service. `online` additionally requires a
+successful fresh device read. Generation checks prevent old recovery probes from
+overriding later resets. Reset invalidates controller relay belief and queued data.
+The UI requests explicit confirmation naming the target before sending a reset.
+Historical charts remain historical while device data is unavailable.
+
+Fault injection (local simulator admin ports, for development):
+
+```sh
+curl -X POST 'http://localhost:5123/channel-fault?ch=1&broken=true'
+curl -X POST 'http://localhost:5123/channel-fault?ch=1&broken=false'
+curl -X POST 'http://localhost:5124/feedback?rpm=0'
+curl -X POST 'http://localhost:5124/feedback?rpm=auto'
+curl -X POST 'http://localhost:5121/temp?value=35'
+curl -X POST 'http://localhost:5121/temp?value=auto'
 ```
 
-The intended reproducible Docker build copies **both** `package.json` and `package-lock.json`, then uses `npm ci`:
-
-```dockerfile
-COPY package.json package-lock.json ./
-RUN npm ci
-```
-
-If your checkout still lacks `frontend/package-lock.json`, generate and commit it with `npm install --package-lock-only` before using `npm ci` in Docker. In the uploaded archive reviewed for this README, the lockfile and Dockerfile had **not yet** been updated together; local changes described afterward should be included in the final commit.
-
-Do not commit `frontend/node_modules/` or `frontend/dist/`; both can be regenerated. Put those paths and `.env` in the root `.gitignore`. If previously tracked, remove them from Git's index using `git rm --cached` while keeping local files.
-
-## 12. Limitations and next steps
-
-### Core hardening
-
-1. **Secrets:** remove Grafana's default `admin` password fallback, make `GRAFANA_PASSWORD` mandatory in Compose, and keep populated `.env` out of Git or shared ZIPs.
-2. **Reproducible frontend builds:** commit `package-lock.json`, copy it explicitly in `frontend/Dockerfile`, and verify `npm ci` in Docker.
-3. **Audit consistency:** configuration update and related event are separate SQL operations; consider one transaction for strong audit guarantees.
-4. **Data retention:** `measurements` has no scheduled cleanup/downsampling. Long-running installations require a retention plan.
-5. **Security:** login rate limiting is not implemented; simulator admin APIs are unauthenticated local test tools.
-6. **Network/deadlines:** Modbus calls use client timeouts, not fully context-cancellable operations; align API and device timeout budgets.
-7. **Realtime transport:** React uses REST polling; WebSocket/SSE is not implemented and is optional for Core.
-8. **JWT renewal:** Core has login/expiry handling, but no refresh-token endpoint or independent administrative capability revocation.
-
-### Extended scope intentionally unfinished
-
-- **Thermocouple:** return and display explicit fault state per channel, including all-channels-faulted behavior.
-- **PWM:** automatic temperature-to-speed curve, manual/auto UI, and visible `command_pct` versus `feedback_rpm` mismatch.
-- **Remote reset:** add a capability-protected Go endpoint, user confirmation, target-specific unknown state and audit records.
-- **Django:** add independent identity database/schema, admin-managed grant/revoke audit, RS256 JWT issuance/refresh and local Go public-key verification. Django must not poll devices or implement device-control logic.
-- **Optional bonuses:** alerts, Modbus RTU, versioned configuration history, tracing, numerical health scores and capability presets are not implemented.
-
-The Core was prioritized over incomplete feature breadth, as recommended by the assessment brief.
-
-## 13. Submission checklist
-
-- [ ] A clean checkout starts with `docker compose up --build` using documented `.env` values.
-- [ ] Docker frontend build succeeds with committed `package-lock.json` and `npm ci`.
-- [ ] `.env`, private keys and real passwords are absent from Git history and submitted archives.
-- [ ] Grafana password fallback has been removed or explicitly secured for local-only use.
-- [ ] Viewer cannot write; operator can change an auxiliary relay and read back its state.
-- [ ] Hysteresis transitions and audit log pass the integration script.
-- [ ] Fault injection causes honest degraded/offline/recovery behavior.
-- [ ] Grafana dashboard loads live metrics from Prometheus.
-- [ ] Go backend and simulator race tests pass.
-- [ ] `AI_USAGE.md` accurately discloses assistant/tool usage.
-- [ ] The README reflects the final source tree and accurately labels unfinished Extended features.
-
-## 14. AI usage
-
-AI-assisted development is disclosed separately in [`AI_USAGE.md`](AI_USAGE.md), as required by the technical assessment. All generated or assisted changes should be understood, verified, and maintainable by the submitting engineer.
+With `.env` configured, run `docker compose config --quiet`, then
+`docker compose up --build -d`. Run `python scripts/smoke_test.py` for Core and
+`python scripts/extended_smoke_test.py` for Extended acceptance against live
+simulators. The Extended script temporarily changes control configuration and
+injects faults, then restores configuration and automatic simulation in `finally`.
+It exercises channel fault isolation, all-channel faults/recovery, AUTO/PWM,
+manual read-back, feedback divergence, four device resets, viewer denial and audit.
+Negative encoding, timeout/connection cleanup and generation behavior have Go tests.
+Run `go test ./...` and `go test -race ./...` in each Go module, plus `npm test`
+and `npm run build` in frontend. Race tests require a supported architecture and C
+compiler (the local Windows/386 Go toolchain does not support race detection).
