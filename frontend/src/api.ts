@@ -1,4 +1,4 @@
-import { AuditEvent, ControlConfig, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
+import { ThermocoupleSnapshot, SpeedState, AuditEvent, ControlConfig, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string) {
@@ -44,6 +44,10 @@ async function req<T>(path: string, token: string | null, init?: RequestInit): P
 }
 
 export const api = {
+ thermocouple: (token:string,signal?:AbortSignal)=>req<ThermocoupleSnapshot>('/api/thermocouple',token,{signal}),
+ speed: (token:string,signal?:AbortSignal)=>req<SpeedState>('/api/fan/speed',token,{signal}),
+ setSpeed: (token:string,percent:number)=>req<SpeedState>('/api/fan/speed',token,{method:'POST',body:JSON.stringify({percent})}),
+ reset: (token:string,target:string)=>req<{target:string;state:string}>('/api/reset',token,{method:'POST',body:JSON.stringify({target})}),
   login: (username: string, password: string) =>
     req<{ token: string; expires_at: string }>('/api/auth/login', null, {
       method: 'POST',

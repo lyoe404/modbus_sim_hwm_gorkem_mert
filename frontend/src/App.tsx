@@ -3,7 +3,8 @@ import { Activity, AlertTriangle, CheckCircle2, Cpu, ExternalLink, Lock, LogOut,
 import { api, ApiError } from './api';
 import { createPolling } from './polling';
 import { LiveChart } from './LiveChart';
-import { AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
+import { ExtendedPanels } from './ExtendedPanels';
+import { ThermocoupleSnapshot, SpeedState, AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
 
 export function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('hwm_token'));
@@ -13,6 +14,14 @@ export function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [loadingLogin, setLoadingLogin] = useState(false);
 
+  const [thermocouple, setThermocouple] = useState<ThermocoupleSnapshot|null>(null);
+  const [speed, setSpeed] = useState<SpeedState|null>(null);
+  const speedRevision = useRef(0);
+  const controlRevision = useRef(0);
+  const resetEpoch = useRef<Record<string,number>>({});
+  const [resetting, setResetting] = useState<Record<string,boolean>>({});
+  const [thermoAt, setThermoAt] = useState(0);
+ const [speedAt,setSpeedAt]=useState(0);
   const [backendOffline, setBackendOffline] = useState(false);
   const [devices, setDevices] = useState<DeviceStatus[]>([]);
   const [temps, setTemps] = useState<MeasurementPoint[]>([]);
@@ -95,9 +104,24 @@ export function App() {
     const polling = createPolling(async signal => {
       try {
         const tasks: Promise<void>[] = [];
+        const speedVersion = speedRevision.current;
+        const controlVersion = controlRevision.current;
 
+        if (hasPerm('read:thermocouple')) tasks.push(api.thermocouple(token,signal).then(value=>{if(!signal.aborted){setThermocouple(value);setThermoAt(Date.now());}}).catch(err=>{if(!signal.aborted)setThermocouple(null);if(err instanceof ApiError && err.status===401)throw err;}));
+        if (hasPerm('read:fan_speed')) tasks.push(api.speed(token,signal).then(value=>{if(!signal.aborted && speedVersion === speedRevision.current){setSpeed(value);setSpeedAt(Date.now());}}).catch(err=>{if(!signal.aborted && speedVersion === speedRevision.current)setSpeed(null);if(err instanceof ApiError && err.status===401)throw err;}));
         if (hasPerm('read:device_status')) {
-          tasks.push(api.devices(token, signal).then(value => { if (!signal.aborted) setDevices(value); }));
+          tasks.push(api.devices(token, signal).then(value => {
+            if (signal.aborted) return;
+            setDevices(value);
+            setResetting(previous => {
+              const next = { ...previous };
+              for (const device of value) {
+                const target = device.name === 'sensor' ? 'temp-humidity' : device.name === 'fan_speed' ? 'speed-pwm' : device.name;
+                if (device.state === 'online' && Date.parse(device.last_seen ?? '') > (resetEpoch.current[target] ?? 0)) delete next[target];
+              }
+              return next;
+            });
+          }));
         }
         if (hasPerm('read:sensor')) {
           tasks.push(Promise.allSettled([
@@ -136,6 +160,7 @@ export function App() {
           tasks.push(
             api.getControl(token, signal).then((snap) => {
               if (signal.aborted) return;
+              if (controlVersion !== controlRevision.current) return;
               setControl(snap);
               setOnAboveInput((prev) => (document.activeElement?.id === 'on_above' ? prev : String(snap.config.on_above)));
               setOffBelowInput((prev) => (document.activeElement?.id === 'off_below' ? prev : String(snap.config.off_below)));
@@ -321,14 +346,14 @@ export function App() {
   }
 
   const canWriteRelay = hasPerm('write:relay');
-  const relayDeviceOnline = devices.some(d => d.name === 'relay' && d.state === 'online');
+  const relayDeviceOnline = !resetting.relay && devices.some(d => d.name === 'relay' && d.state === 'online');
   const sensorDeviceOnline = devices.some(d => d.name === 'sensor' && d.state === 'online');
   const canWriteThresholds = hasPerm('write:thresholds');
   const sensorLatestAt = Math.max(0, ...[temps[temps.length - 1], humids[humids.length - 1]]
     .filter((point): point is MeasurementPoint => Boolean(point))
     .map(point => new Date(point.at).getTime()));
   const sensorQuality: 'live' | 'stale' | 'unknown' =
-    backendOffline || sensorFetchFailed || !sensorDeviceOnline || sensorLatestAt === 0
+    backendOffline || resetting['temp-humidity'] || sensorFetchFailed || !sensorDeviceOnline || sensorLatestAt === 0
       ? 'unknown'
       : clock - sensorLatestAt > 10000 ? 'stale' : 'live';
   const autoFanChannel = control?.config.fan_channel;
@@ -673,6 +698,46 @@ export function App() {
             </div>
           )}
         </section>
+
+        <ExtendedPanels
+          key={token}
+          token={token}
+          hasPerm={hasPerm}
+          thermocouple={thermocouple}
+          speed={speed}
+          control={control}
+          devices={devices}
+          resetting={resetting}
+          thermoLive={!backendOffline && !resetting.thermocouple && clock - thermoAt <= 6000}
+          speedLive={!backendOffline && !resetting['speed-pwm'] && clock - speedAt <= 6000}
+          backendOffline={backendOffline}
+          onControl={snap => {
+            controlRevision.current++;
+            setControl(snap);
+            setEnabledInput(snap.config.enabled);
+            pollAll();
+          }}
+          onSpeed={value => {
+            speedRevision.current++;
+            setSpeed(value);
+            setSpeedAt(Date.now());
+            pollAll();
+          }}
+          onReset={async target => {
+            resetEpoch.current[target] = Infinity;
+            setResetting(previous => ({ ...previous, [target]: true }));
+            if (target === 'temp-humidity') { setTemps([]); setHumids([]); setSensorFetchFailed(true); }
+            if (target === 'relay') setRelays([]);
+            if (target === 'thermocouple') setThermocouple(null);
+            if (target === 'speed-pwm') { speedRevision.current++; setSpeed(null); }
+            try {
+              await api.reset(token, target);
+            } finally {
+              resetEpoch.current[target] = Date.now();
+              pollAll();
+            }
+          }}
+        />
 
         {/* Audit & Event Log */}
         {hasPerm('read:events') && (

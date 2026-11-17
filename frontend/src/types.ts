@@ -46,3 +46,7 @@ export interface AuditEvent {
   actor?: string;
   at: string;
 }
+
+export interface ThermocoupleChannel { source: string; status: 'live'|'fault'|'unknown'; temperature_c: number|null; last_valid_at: string }
+export interface ThermocoupleSnapshot { channels: ThermocoupleChannel[]; all_channels_faulted: boolean }
+export interface SpeedState { command_pct: number; feedback_rpm: number; mismatch: boolean }
