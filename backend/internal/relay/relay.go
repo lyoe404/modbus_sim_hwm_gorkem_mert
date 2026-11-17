@@ -127,8 +127,13 @@ func (r *Controller) Set(ctx context.Context, id int, on bool) (Result, error) {
 		return res, fmt.Errorf("%w: %w", ErrWriteFailed, err)
 	}
 	if err := r.c.WriteCoil(uint16(id), on); err != nil {
-		r.drop()
-		return res, fmt.Errorf("%w: %w", ErrWriteFailed, err)
+		if errors.Is(err, modbus.ErrIllegalFunction) {
+			err = r.c.WriteCoils(uint16(id), []bool{on})
+		}
+		if err != nil {
+			r.drop()
+			return res, fmt.Errorf("%w: %w", ErrWriteFailed, err)
+		}
 	}
 	actual, err := r.c.ReadCoil(uint16(id))
 	if err != nil {
