@@ -15,8 +15,11 @@ import (
 
 	"github.com/simonvetter/modbus"
 
-	"sim/internal/device"
+	"sim/internal/fault"
+	relay "sim/internal/relay"
 )
+
+var _ = strconv.Atoi // keep import if unused in some binaries
 
 type supervisor struct {
 	mu  sync.Mutex
@@ -67,46 +70,35 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	store := device.NewStore()
-	sup := &supervisor{url: "tcp://" + env("MODBUS_ADDR", "0.0.0.0:5020"), h: device.NewHandler(store)}
+	store := relay.NewStore()
+	sup := &supervisor{
+		url: "tcp://" + env("MODBUS_ADDR", "0.0.0.0:5022"),
+		h:   relay.NewHandler(store),
+	}
 	if err := sup.up(); err != nil {
 		log.Error("modbus listener failed", "err", err)
 		os.Exit(1)
 	}
 	defer sup.down()
-	log.Info("modbus-sim listening", "url", sup.url)
+	log.Info("relay-sim listening", "url", sup.url)
 
-	// Sensor random walk.
-	go func() {
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				store.Step()
-			}
-		}
-	}()
-
-	// Admin / fault-injection API.
 	mux := http.NewServeMux()
 	writeJSON := func(w http.ResponseWriter, code int, v any) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(v)
 	}
+
 	mux.HandleFunc("/state", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, store.Snapshot())
 	})
-	// POST /fault?mode=none|slow|timeout|error|garbage|down[&delay=3s]
+
 	mux.HandleFunc("/fault", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		mode, err := device.ParseFaultMode(r.URL.Query().Get("mode"))
+		mode, err := fault.ParseMode(r.URL.Query().Get("mode"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -119,7 +111,7 @@ func main() {
 			}
 		}
 		store.SetFault(mode, delay)
-		if mode == device.FaultDown {
+		if mode == fault.Down {
 			sup.down()
 		} else if err := sup.up(); err != nil {
 			http.Error(w, "restart failed: "+err.Error(), http.StatusInternalServerError)
@@ -128,28 +120,9 @@ func main() {
 		log.Info("fault set", "mode", mode)
 		writeJSON(w, http.StatusOK, store.Snapshot())
 	})
-	// POST /temp?value=33.5  pins the temperature; /temp?value=auto resumes the walk.
-	mux.HandleFunc("/temp", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		v := r.URL.Query().Get("value")
-		if v == "auto" {
-			store.UnpinTemp()
-		} else {
-			f, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				http.Error(w, "value must be a number or 'auto'", http.StatusBadRequest)
-				return
-			}
-			store.PinTemp(f)
-		}
-		writeJSON(w, http.StatusOK, store.Snapshot())
-	})
 
 	admin := &http.Server{
-		Addr:              env("ADMIN_ADDR", "0.0.0.0:5021"),
+		Addr:              env("ADMIN_ADDR", "0.0.0.0:5122"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}

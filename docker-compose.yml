@@ -1,18 +1,85 @@
-# One command: `cp .env.example .env && docker compose up --build`
 services:
-  modbus-sim:
+  temp-humidity-sim:
     build: ./simulators
+    entrypoint: ["/usr/local/bin/temp-humidity-sim"]
     restart: unless-stopped
-    # Fault-injection admin API is unauthenticated by design (it is a test tool):
-    # published on the host loopback only. The Modbus port stays inside the compose network.
+    environment:
+      MODBUS_ADDR: 0.0.0.0:5021
+      ADMIN_ADDR: 0.0.0.0:5121
     ports:
-      - "127.0.0.1:${SIM_ADMIN_PORT:-5021}:5021"
+      - "127.0.0.1:5121:5121"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5121/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  relay-sim:
+    build: ./simulators
+    entrypoint: ["/usr/local/bin/relay-sim"]
+    restart: unless-stopped
+    environment:
+      MODBUS_ADDR: 0.0.0.0:5022
+      ADMIN_ADDR: 0.0.0.0:5122
+    ports:
+      - "127.0.0.1:5122:5122"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5122/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  thermocouple-sim:
+    build: ./simulators
+    entrypoint: ["/usr/local/bin/thermocouple-sim"]
+    restart: unless-stopped
+    environment:
+      MODBUS_ADDR: 0.0.0.0:5023
+      ADMIN_ADDR: 0.0.0.0:5123
+    ports:
+      - "127.0.0.1:5123:5123"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5123/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  speed-pwm-sim:
+    build: ./simulators
+    entrypoint: ["/usr/local/bin/speed-pwm-sim"]
+    restart: unless-stopped
+    environment:
+      MODBUS_ADDR: 0.0.0.0:5024
+      ADMIN_ADDR: 0.0.0.0:5124
+    ports:
+      - "127.0.0.1:5124:5124"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5124/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  remote-reset-sim:
+    build: ./simulators
+    entrypoint: ["/usr/local/bin/remote-reset-sim"]
+    restart: unless-stopped
+    environment:
+      TCP_ADDR: 0.0.0.0:9001
+      TEMP_HUMIDITY_ADMIN_URL: http://temp-humidity-sim:5121
+      RELAY_ADMIN_URL: http://relay-sim:5122
+      THERMOCOUPLE_ADMIN_URL: http://thermocouple-sim:5123
+      SPEED_PWM_ADMIN_URL: http://speed-pwm-sim:5124
+      RESET_DURATION: 5s
+    ports:
+      - "127.0.0.1:${SIM_ADMIN_PORT:-5021}:9001"
 
   backend:
     build: ./backend
     restart: unless-stopped
     depends_on:
-      modbus-sim:
+      temp-humidity-sim:
+        condition: service_healthy
+      relay-sim:
         condition: service_healthy
     environment:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (copy .env.example)}
@@ -20,7 +87,7 @@ services:
       VIEWER_PASSWORD: ${VIEWER_PASSWORD:?set VIEWER_PASSWORD in .env}
       OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
       OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?set OPERATOR_PASSWORD in .env}
-      MODBUS_URL: tcp://modbus-sim:5020
+      MODBUS_URL: tcp://temp-humidity-sim:5021
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:
@@ -33,6 +100,7 @@ services:
       - backend
     ports:
       - "${FRONTEND_PORT:-3000}:80"
+
   prometheus:
     image: prom/prometheus:v2.55.1
     restart: unless-stopped

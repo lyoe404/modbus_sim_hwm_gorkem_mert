@@ -1,34 +1,31 @@
-package device
+package relay
 
 import (
 	"time"
 
 	"github.com/simonvetter/modbus"
+	"sim/internal/fault"
 )
 
-// Handler implements modbus.RequestHandler on top of a Store, applying the
-// active fault mode to every request.
 type Handler struct{ s *Store }
 
-// NewHandler wraps a store.
 func NewHandler(s *Store) *Handler { return &Handler{s: s} }
 
-// gate applies the fault mode. A non-nil error must be returned to the client.
-func (h *Handler) gate() (FaultMode, error) {
+func (h *Handler) gate() (fault.Mode, error) {
 	mode, delay := h.s.Fault()
 	switch mode {
-	case FaultSlow:
+	case fault.Slow:
 		time.Sleep(delay)
-	case FaultTimeout:
+	case fault.Timeout:
 		time.Sleep(delay)
 		return mode, modbus.ErrServerDeviceFailure
-	case FaultError:
+	case fault.Error:
 		return mode, modbus.ErrServerDeviceFailure
 	}
 	return mode, nil
 }
 
-// HandleCoils serves FC1 (read), FC5 and FC15 (write).
+// HandleCoils serves FC1 (read), FC5 (single write), FC15 (multiple write).
 func (h *Handler) HandleCoils(req *modbus.CoilsRequest) ([]bool, error) {
 	mode, err := h.gate()
 	if err != nil {
@@ -44,38 +41,22 @@ func (h *Handler) HandleCoils(req *modbus.CoilsRequest) ([]bool, error) {
 	if !ok {
 		return nil, modbus.ErrIllegalDataAddress
 	}
-	if mode == FaultGarbage {
+	if mode == fault.Garbage {
 		for i := range vals {
-			vals[i] = !vals[i] // lie about every coil
+			vals[i] = !vals[i] // read-back mismatch simulation
 		}
 	}
 	return vals, nil
 }
 
-// HandleInputRegisters serves FC4.
-func (h *Handler) HandleInputRegisters(req *modbus.InputRegistersRequest) ([]uint16, error) {
-	mode, err := h.gate()
-	if err != nil {
-		return nil, err
-	}
-	vals, ok := h.s.InputRegisters(req.Addr, req.Quantity)
-	if !ok {
-		return nil, modbus.ErrIllegalDataAddress
-	}
-	if mode == FaultGarbage {
-		for i := range vals {
-			vals[i] = GarbageValue
-		}
-	}
-	return vals, nil
+func (h *Handler) HandleInputRegisters(*modbus.InputRegistersRequest) ([]uint16, error) {
+	return nil, modbus.ErrIllegalFunction
 }
 
-// HandleHoldingRegisters is not used yet (speed module is Extended scope).
 func (h *Handler) HandleHoldingRegisters(*modbus.HoldingRegistersRequest) ([]uint16, error) {
 	return nil, modbus.ErrIllegalFunction
 }
 
-// HandleDiscreteInputs is not used by this device.
 func (h *Handler) HandleDiscreteInputs(*modbus.DiscreteInputsRequest) ([]bool, error) {
 	return nil, modbus.ErrIllegalFunction
 }
