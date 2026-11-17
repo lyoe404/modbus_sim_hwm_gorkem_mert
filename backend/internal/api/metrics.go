@@ -29,13 +29,19 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Latest sensor readings (temperature & humidity)
-	since := time.Now().Add(-10 * time.Minute)
-	if temps, err := s.Store.Measurements(ctx, "sensor", "temperature_c", since, 1); err == nil && len(temps) > 0 {
+	since := time.Now().Add(-15 * time.Second)
+	sensorOnline := false
+	for _, st := range s.Statuses() {
+		if st.Name == "sensor" && st.State == "online" && time.Since(st.LastSeen) < 15*time.Second {
+			sensorOnline = true
+		}
+	}
+	if temps, err := s.Store.Measurements(ctx, "sensor", "temperature_c", since, 1); sensorOnline && err == nil && len(temps) > 0 {
 		b.WriteString("# HELP hwm_sensor_temperature_celsius Latest ambient temperature in Celsius\n")
 		b.WriteString("# TYPE hwm_sensor_temperature_celsius gauge\n")
 		fmt.Fprintf(&b, "hwm_sensor_temperature_celsius{source=%q} %.2f\n", temps[0].Source, temps[0].Value)
 	}
-	if humids, err := s.Store.Measurements(ctx, "sensor", "humidity_pct", since, 1); err == nil && len(humids) > 0 {
+	if humids, err := s.Store.Measurements(ctx, "sensor", "humidity_pct", since, 1); sensorOnline && err == nil && len(humids) > 0 {
 		b.WriteString("# HELP hwm_sensor_humidity_percent Latest relative humidity percentage\n")
 		b.WriteString("# TYPE hwm_sensor_humidity_percent gauge\n")
 		fmt.Fprintf(&b, "hwm_sensor_humidity_percent{source=%q} %.2f\n", humids[0].Source, humids[0].Value)
