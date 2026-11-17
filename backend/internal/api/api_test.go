@@ -79,6 +79,13 @@ func (f *fakeControl) UpdateConfig(_ context.Context, cfg control.Config, by str
 }
 func (f *fakeControl) callCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.calls }
 
+// allowFanManual explicitly changes the fake control mode before writing fan coil.
+func (f *fakeControl) allowFanManual() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cfg.Enabled = false
+}
+
 type env struct {
 	h       http.Handler
 	relays  *fakeRelays
@@ -180,6 +187,7 @@ func TestViewerCanReadButNotControl(t *testing.T) {
 
 func TestOperatorControlsRelayAndIsAudited(t *testing.T) {
 	e := newEnv(t)
+	e.control.allowFanManual()
 	tok := e.login(t, "operator", "operator-pass-1")
 
 	rec := e.do("POST", "/api/relays/0", tok, `{"on":true}`)
@@ -195,6 +203,7 @@ func TestSingleCapabilityIsEnough(t *testing.T) {
 	// A token with ONLY write:relay may switch relays but nothing else:
 	// routes check capabilities, not roles.
 	e := newEnv(t)
+	e.control.allowFanManual()
 	tok, _, _ := e.tokens.Issue("custom", "custom", []string{auth.WriteRelay})
 	if rec := e.do("POST", "/api/relays/0", tok, `{"on":true}`); rec.Code != 200 {
 		t.Fatalf("relay write = %d", rec.Code)
@@ -218,6 +227,7 @@ func TestRelayErrorsMapToDistinctStatuses(t *testing.T) {
 	}
 	for _, c := range cases {
 		e := newEnv(t)
+		e.control.allowFanManual()
 		e.relays.err = c.err
 		tok := e.login(t, "operator", "operator-pass-1")
 		rec := e.do("POST", "/api/relays/0", tok, `{"on":true}`)

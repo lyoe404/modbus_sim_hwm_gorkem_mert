@@ -92,6 +92,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("relay labels: %w", err)
 	}
+
 	relayURL := env("RELAY_MODBUS_URL", "tcp://relay-sim:5022")
 	relays := &relay.Controller{
 		URL:     relayURL,

@@ -17,6 +17,7 @@ import (
 	"backend/internal/control"
 	"backend/internal/poller"
 	"backend/internal/relay"
+	"backend/internal/speed"
 	"backend/internal/store"
 )
 
@@ -46,6 +47,7 @@ type Server struct {
 	Store    Store
 	Relays   Relays
 	Control  Control
+	Speed    *speed.Controller
 	Statuses func() []poller.DeviceStatus
 	Log      *slog.Logger
 }
@@ -87,8 +89,31 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/auth/me", only(http.MethodGet, auth.Guard(s.Tokens)(http.HandlerFunc(s.me))))
 
 	mux.Handle("/api/devices", only(http.MethodGet, guard(auth.ReadDeviceStatus, s.devices)))
-	mux.Handle("/api/measurements", only(http.MethodGet, guard(auth.ReadSensor, s.measurements)))
+	mux.Handle("/api/measurements", only(http.MethodGet, auth.Guard(s.Tokens)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		required := auth.ReadSensor
+		if strings.HasPrefix(r.URL.Query().Get("source"), "thermocouple") {
+			required = auth.ReadThermocouple
+		}
+		claims, _ := auth.ClaimsFrom(r.Context())
+		for _, perm := range claims.Perms {
+			if perm == required {
+				s.measurements(w, r)
+				return
+			}
+		}
+		writeErr(w, http.StatusForbidden, "forbidden")
+	}))))
 	mux.Handle("/api/events", only(http.MethodGet, guard(auth.ReadEvents, s.events)))
+	mux.Handle("/api/fan/speed", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			guard(auth.ReadFanSpeed, s.getSpeed).ServeHTTP(w, r)
+		case http.MethodPost:
+			guard(auth.WriteFanSpeed, s.setSpeed).ServeHTTP(w, r)
+		default:
+			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	}))
 	mux.Handle("/api/relays", only(http.MethodGet, guard(auth.ReadRelay, s.listRelays)))
 	mux.Handle("/api/relays/", only(http.MethodPost, guard(auth.WriteRelay, s.setRelay)))
 
@@ -233,10 +258,36 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims, _ := auth.ClaimsFrom(r.Context())
-
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	res, err := s.Relays.Set(ctx, id, *req.On)
+	var res relay.Result
+	var errWrite error
+	write := func() error {
+		res, errWrite = s.Relays.Set(ctx, id, *req.On)
+		if errWrite == nil {
+			if observer, ok := s.Control.(interface{ ObserveManualRelay(int, bool) }); ok {
+				observer.ObserveManualRelay(id, res.Actual)
+			}
+		}
+		return errWrite
+	}
+	if controlled, ok := s.Control.(interface{ ManualOperation(int, func() error) error }); ok {
+		errWrite = controlled.ManualOperation(id, write)
+	} else {
+		if s.Control != nil {
+			cfg := s.Control.Snapshot().Config
+			if cfg.Enabled && cfg.FanChannel == id {
+				writeErr(w, http.StatusConflict, "fan_in_auto_mode_switch_to_manual_first")
+				return
+			}
+		}
+		errWrite = write()
+	}
+	if errors.Is(errWrite, control.ErrFanAutoMode) {
+		writeErr(w, http.StatusConflict, "fan_in_auto_mode_switch_to_manual_first")
+		return
+	}
+	err = errWrite
 
 	status, code := http.StatusOK, "ok"
 	switch {
@@ -261,7 +312,8 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]any{"error": code, "result": res})
 		return
 	}
-	writeJSON(w, status, res)
+	// The UI consumes a Channel shape; return confirmed read-back, not the command.
+	writeJSON(w, status, relay.Channel{ID: id, Label: res.Label, On: res.Actual})
 }
 
 // audit records who did what, using the username from the verified token.
@@ -289,7 +341,6 @@ func (s *Server) putControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims, _ := auth.ClaimsFrom(r.Context())
-
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := s.Control.UpdateConfig(ctx, cfg, claims.Username); err != nil {
@@ -302,4 +353,46 @@ func (s *Server) putControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Control.Snapshot())
+}
+
+func (s *Server) getSpeed(w http.ResponseWriter, r *http.Request) {
+	if s.Speed == nil {
+		writeErr(w, 503, "speed_unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	st, err := s.Speed.Status(ctx)
+	if err != nil {
+		writeErr(w, 502, "device_unreachable")
+		return
+	}
+	writeJSON(w, 200, st)
+}
+func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
+	if s.Speed == nil {
+		writeErr(w, 503, "speed_unavailable")
+		return
+	}
+	var req struct {
+		Percent *int `json:"percent"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Percent == nil || *req.Percent < 0 || *req.Percent > 100 {
+		writeErr(w, 400, "percent_must_be_0_to_100")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	st, err := s.Speed.Set(ctx, *req.Percent)
+	claims, _ := auth.ClaimsFrom(r.Context())
+	msg := fmt.Sprintf("speed_pct=%d feedback_rpm=%d error=%v", *req.Percent, st.FeedbackRPM, err)
+	if auditErr := s.Store.AddEvent(ctx, store.Event{Kind: "fan_speed_write", Source: "fan_speed", Message: msg, Actor: claims.Username}); auditErr != nil {
+		s.Log.Error("speed audit", "err", auditErr)
+	}
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"error": "speed_write_failed", "detail": err.Error(), "state": st})
+		return
+	}
+	writeJSON(w, 200, st)
 }

@@ -44,6 +44,7 @@ func eventRecorder(db *store.Store) control.Recorder {
 	})
 }
 
+// fanCoilReader reads a real Modbus coil (not the last command).
 type fanCoilReader struct{ controller *relay.Controller }
 
 func (r fanCoilReader) ReadFan(ctx context.Context, channel int) (bool, error) {
