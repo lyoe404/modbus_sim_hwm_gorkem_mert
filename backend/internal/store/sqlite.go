@@ -35,6 +35,15 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
 -- Runtime-editable configuration (e.g. control thresholds). Every change is
 -- also written to the events log, which is the history.
+CREATE TABLE IF NOT EXISTS device_states (
+    device_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    last_seen INTEGER, -- NULL until first successful poll
+    last_error TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS config (
 	key        TEXT    PRIMARY KEY,
 	value      TEXT    NOT NULL,       -- JSON
@@ -183,4 +192,48 @@ func (s *Store) PutConfig(ctx context.Context, key, value, by string) error {
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
 		key, value, time.Now().UnixMilli(), by)
 	return err
+}
+
+// SaveDeviceStatus stores the last observed health of a device. On process restart
+// the API still uses live pollers (initially unknown), never the old online row.
+func (s *Store) SaveDeviceStatus(ctx context.Context, st poller.DeviceStatus) error {
+	var lastSeen any
+	if !st.LastSeen.IsZero() {
+		lastSeen = st.LastSeen.UnixMilli()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO device_states
+        (device_id, state, last_seen, last_error, consecutive_failures, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE SET
+        state=excluded.state, last_seen=excluded.last_seen,
+        last_error=excluded.last_error, consecutive_failures=excluded.consecutive_failures,
+        updated_at=excluded.updated_at`,
+		st.Name, string(st.State), lastSeen, st.LastError, st.ConsecutiveFailures, time.Now().UnixMilli())
+	return err
+}
+
+// DeviceStates returns persisted statuses for diagnostics/history, not an
+// authoritative source for current control decisions.
+func (s *Store) DeviceStates(ctx context.Context) ([]poller.DeviceStatus, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT device_id, state, last_seen, last_error,
+        consecutive_failures FROM device_states ORDER BY device_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []poller.DeviceStatus{}
+	for rows.Next() {
+		var st poller.DeviceStatus
+		var state string
+		var lastSeen sql.NullInt64
+		if err := rows.Scan(&st.Name, &state, &lastSeen, &st.LastError, &st.ConsecutiveFailures); err != nil {
+			return nil, err
+		}
+		st.State = poller.State(state)
+		if lastSeen.Valid {
+			st.LastSeen = time.UnixMilli(lastSeen.Int64).UTC()
+		}
+		result = append(result, st)
+	}
+	return result, rows.Err()
 }
