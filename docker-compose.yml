@@ -71,7 +71,12 @@ services:
       SPEED_PWM_ADMIN_URL: http://speed-pwm-sim:5124
       RESET_DURATION: 5s
     ports:
-      - "127.0.0.1:${SIM_ADMIN_PORT:-5021}:9001"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/remote-reset-sim", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   backend:
     build: ./backend
@@ -81,6 +86,10 @@ services:
         condition: service_healthy
       relay-sim:
         condition: service_healthy
+      thermocouple-sim:
+        condition: service_healthy
+      speed-pwm-sim:
+        condition: service_healthy
     environment:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (copy .env.example)}
       VIEWER_USERNAME: ${VIEWER_USERNAME:-viewer}
@@ -88,13 +97,20 @@ services:
       OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
       OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?set OPERATOR_PASSWORD in .env}
       MODBUS_URL: tcp://temp-humidity-sim:5021
+      RELAY_MODBUS_URL: tcp://relay-sim:5022
+      THERMOCOUPLE_MODBUS_URL: tcp://thermocouple-sim:5023
+      SPEED_MODBUS_URL: tcp://speed-pwm-sim:5024
+      DB_PATH: /data/backend.db
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:
       - backend-data:/data
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_GRAFANA_PORT: ${GRAFANA_PORT:-3001}
     restart: unless-stopped
     depends_on:
       - backend
