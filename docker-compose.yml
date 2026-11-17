@@ -90,6 +90,8 @@ services:
         condition: service_healthy
       speed-pwm-sim:
         condition: service_healthy
+      remote-reset-sim:
+        condition: service_healthy
     environment:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (copy .env.example)}
       VIEWER_USERNAME: ${VIEWER_USERNAME:-viewer}
@@ -100,6 +102,7 @@ services:
       RELAY_MODBUS_URL: tcp://relay-sim:5022
       THERMOCOUPLE_MODBUS_URL: tcp://thermocouple-sim:5023
       SPEED_MODBUS_URL: tcp://speed-pwm-sim:5024
+      RESET_TCP_ADDR: ${RESET_TCP_ADDR:-remote-reset-sim:9001}
       DB_PATH: /data/backend.db
     ports:
       - "${BACKEND_PORT:-8080}:8080"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Non-destructive, standard-library Core HTTP smoke test.
+"""Standard-library Core HTTP smoke test; restores the tested relay state.
 Requires `docker compose up -d --build` and .env test credentials.
 """
 import json
@@ -48,6 +48,16 @@ def login(prefix, fallback):
     return data['token']
 
 
+def set_and_verify_relay(token, channel_id, on):
+    code, actual = request(f'/api/relays/{channel_id}', 'POST', token, {'on': on})
+    assert code == 200 and actual['id'] == channel_id and actual['on'] is on, (code, actual)
+    # Read independently: the write response alone cannot prove the next coil read agrees.
+    code, channels = request('/api/relays', token=token)
+    assert code == 200 and isinstance(channels, list), (code, channels)
+    channel = next((ch for ch in channels if ch['id'] == channel_id), None)
+    assert channel is not None and channel['on'] is on, (channel_id, on, channels)
+
+
 def main():
     code, result = request('/healthz')
     assert code == 200, (code, result)
@@ -70,14 +80,25 @@ def main():
     code, channels = request('/api/relays', token=operator)
     assert code == 200 and len(channels) >= 4, (code, channels)
     print('[OK] relay read-back:', len(channels), 'channels')
-    # Use an auxiliary channel to avoid interacting with automatic fan channel 0.
-    target = channels[3]
-    code, actual = request('/api/relays/3', 'POST', operator, {'on': target['on']})
-    assert code == 200 and actual['id'] == 3 and actual['on'] == target['on'], (code, actual)
-    print('[OK] operator coil write + confirmed read-back')
     code, cfg = request('/api/config/control', token=operator)
     assert code == 200 and cfg.get('config'), (code, cfg)
     print('[OK] live hysteresis config')
+    # Prefer auxiliary CH3, but never touch the configured fan channel.
+    
+    candidates = [ch for ch in channels if ch['id'] != cfg['config']['fan_channel']]
+    assert candidates, 'No relay available outside the fan control loop'
+    target = next((ch for ch in candidates if ch['id'] == 3), candidates[0])
+    channel_id, original = target['id'], target['on']
+    assert isinstance(original, bool), target
+    try:
+        set_and_verify_relay(operator, channel_id, not original)
+        print(f'[OK] CH{channel_id} {"ON" if original else "OFF"} -> '
+              f'{"OFF" if original else "ON"}: write response + independent read-back')
+    finally:
+        # Restore even when the first write or its independent read-back fails.
+        set_and_verify_relay(operator, channel_id, original)
+        print(f'[OK] CH{channel_id} restored {"ON" if original else "OFF"}: '
+              'write response + independent read-back')
     code, events = request('/api/events?limit=10', token=operator)
     assert code == 200 and isinstance(events, list), (code, events)
     print('[OK] event log')
