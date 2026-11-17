@@ -22,6 +22,7 @@ type Poller struct {
 	sink     Sink
 	log      *slog.Logger
 	onChange func(DeviceStatus)
+	onPoll   func(DeviceStatus)
 
 	mu     sync.RWMutex
 	status DeviceStatus
@@ -41,6 +42,10 @@ func New(cfg Config, r Reader, s Sink, log *slog.Logger, onChange func(DeviceSta
 		status: DeviceStatus{Name: cfg.Name, State: StateUnknown},
 	}
 }
+
+// SetOnPoll registers a callback for *every* completed poll, including repeated
+// failures. Configure before Run; it must not be replaced while Run is active.
+func (p *Poller) SetOnPoll(fn func(DeviceStatus)) { p.onPoll = fn }
 
 // Status returns a copy of the current status; safe for concurrent use.
 func (p *Poller) Status() DeviceStatus {
@@ -107,6 +112,9 @@ func (p *Poller) record(failures int, err error) {
 	cur := p.status
 	p.mu.Unlock()
 
+	if p.onPoll != nil {
+		p.onPoll(cur)
+	}
 	if cur.State != prev {
 		p.log.Info("status changed", "from", prev, "to", cur.State)
 		if p.onChange != nil {
