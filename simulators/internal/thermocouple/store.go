@@ -14,7 +14,7 @@ type Store struct {
 	rng          *rand.Rand
 	channels     [ChannelCount]float64
 	channelFault [ChannelCount]bool
-	pinned       bool
+	pinned       [ChannelCount]bool
 	faultMode    fault.Mode
 	faultDelay   time.Duration
 }
@@ -33,10 +33,10 @@ func clamp(v, lo, hi float64) float64 { return math.Max(lo, math.Min(hi, v)) }
 func (s *Store) Step() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pinned {
-		return
-	}
 	for i := 0; i < ChannelCount; i++ {
+		if s.pinned[i] {
+			continue
+		}
 		s.channels[i] = clamp(s.channels[i]+(s.rng.Float64()-0.5)*2.5, TempMin, TempMax)
 	}
 }
@@ -48,14 +48,25 @@ func (s *Store) PinChannel(ch int, v float64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.channels[ch] = clamp(v, -200, 1300)
-	s.pinned = true
+	s.pinned[ch] = true
+	return true
+}
+
+func (s *Store) UnpinChannel(ch int) bool {
+	if ch < 0 || ch >= ChannelCount {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pinned[ch] = false
+	s.channels[ch] = clamp(s.channels[ch], TempMin, TempMax)
 	return true
 }
 
 func (s *Store) UnpinAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pinned = false
+	s.pinned = [ChannelCount]bool{}
 }
 
 func (s *Store) SetChannelFault(ch int, broken bool) bool {
@@ -115,6 +126,7 @@ type Snapshot struct {
 	Device       string                `json:"device"`
 	ChannelsC    [ChannelCount]float64 `json:"channels_c"`
 	ChannelFault [ChannelCount]bool    `json:"channel_fault"`
+	Pinned       [ChannelCount]bool    `json:"pinned"`
 	Fault        fault.Mode            `json:"fault"`
 	FaultDelay   string                `json:"fault_delay"`
 }
@@ -130,6 +142,7 @@ func (s *Store) Snapshot() Snapshot {
 		Device:       "thermocouple-module",
 		ChannelsC:    rounded,
 		ChannelFault: s.channelFault,
+		Pinned:       s.pinned,
 		Fault:        s.faultMode,
 		FaultDelay:   s.faultDelay.String(),
 	}
