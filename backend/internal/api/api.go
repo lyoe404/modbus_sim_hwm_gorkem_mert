@@ -39,7 +39,7 @@ type Relays interface {
 // Control is the auto-control engine (implemented by *control.Engine).
 type Control interface {
 	Snapshot() control.Snapshot
-	UpdateConfig(ctx context.Context, cfg control.Config, by string) error
+	PatchConfig(ctx context.Context, patch control.ConfigPatch, by string) error
 }
 
 // Server wires the dependencies of the API.
@@ -357,18 +357,18 @@ func (s *Server) getControl(w http.ResponseWriter, _ *http.Request) {
 // putControl edits the control configuration. Omitted fields keep their
 // current value; unknown fields are rejected so typos do not pass silently.
 func (s *Server) putControl(w http.ResponseWriter, r *http.Request) {
-	cfg := s.Control.Snapshot().Config
+	var patch control.ConfigPatch
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
+	if err := dec.Decode(&patch); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
 	claims, _ := auth.ClaimsFrom(r.Context())
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := s.Control.UpdateConfig(ctx, cfg, claims.Username); err != nil {
+	if err := s.Control.PatchConfig(ctx, patch, claims.Username); err != nil {
 		if errors.Is(err, control.ErrInvalidConfig) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_config", "detail": err.Error()})
 			return

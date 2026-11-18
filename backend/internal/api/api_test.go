@@ -67,10 +67,11 @@ func (f *fakeControl) Snapshot() control.Snapshot {
 	defer f.mu.Unlock()
 	return control.Snapshot{Config: f.cfg}
 }
-func (f *fakeControl) UpdateConfig(_ context.Context, cfg control.Config, by string) error {
+func (f *fakeControl) PatchConfig(_ context.Context, patch control.ConfigPatch, by string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	cfg := patch.Apply(f.cfg)
 	if err := cfg.Validate(8); err != nil {
 		return err
 	}

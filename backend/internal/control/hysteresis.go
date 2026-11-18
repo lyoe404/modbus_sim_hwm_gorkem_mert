@@ -27,6 +27,30 @@ type Config struct {
 	FanChannel int     `json:"fan_channel"` // relay channel that drives the fan
 }
 
+// ConfigPatch carries only the fields supplied by a control configuration request.
+type ConfigPatch struct {
+	Enabled    *bool    `json:"enabled"`
+	OnAbove    *float64 `json:"on_above"`
+	OffBelow   *float64 `json:"off_below"`
+	FanChannel *int     `json:"fan_channel"`
+}
+
+func (p ConfigPatch) Apply(c Config) Config {
+	if p.Enabled != nil {
+		c.Enabled = *p.Enabled
+	}
+	if p.OnAbove != nil {
+		c.OnAbove = *p.OnAbove
+	}
+	if p.OffBelow != nil {
+		c.OffBelow = *p.OffBelow
+	}
+	if p.FanChannel != nil {
+		c.FanChannel = *p.FanChannel
+	}
+	return c
+}
+
 // DefaultConfig matches the brief's reference values (on above 30, off below 27).
 func DefaultConfig() Config {
 	return Config{Enabled: true, OnAbove: 30.0, OffBelow: 27.0, FanChannel: 0}

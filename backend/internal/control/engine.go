@@ -100,7 +100,6 @@ type Engine struct {
 	maxAge        time.Duration
 	now           func() time.Time
 
-	updateMu    sync.Mutex // serialises UpdateConfig
 	operationMu sync.Mutex // serialises mode switches against automatic actuations
 
 	mu         sync.Mutex
@@ -170,13 +169,23 @@ func (e *Engine) Snapshot() Snapshot {
 // effect on the next reading, without a restart. The change is audited with
 // the acting user's name.
 func (e *Engine) UpdateConfig(ctx context.Context, cfg Config, by string) error {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
+	return e.updateConfig(ctx, cfg, by)
+}
+
+// PatchConfig merges, validates and persists a partial edit under the same
+// lock used for full replacements and device operations.
+func (e *Engine) PatchConfig(ctx context.Context, patch ConfigPatch, by string) error {
+	e.operationMu.Lock()
+	defer e.operationMu.Unlock()
+	return e.updateConfig(ctx, patch.Apply(e.Snapshot().Config), by)
+}
+
+func (e *Engine) updateConfig(ctx context.Context, cfg Config, by string) error {
 	if err := cfg.Validate(e.channels); err != nil {
 		return err
 	}
-	e.updateMu.Lock()
-	defer e.updateMu.Unlock()
-	e.operationMu.Lock()
-	defer e.operationMu.Unlock()
 
 	b, err := json.Marshal(cfg)
 	if err != nil {
