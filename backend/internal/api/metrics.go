@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+var metricLabelEscapes = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
+func metricLabel(value string) string {
+	return `"` + metricLabelEscapes.Replace(value) + `"`
+}
+
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
@@ -17,21 +23,24 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	// 1. Device connectivity status
 	b.WriteString("# HELP hwm_device_online Whether the field device is currently online (1=online, 0=degraded/offline)\n")
 	b.WriteString("# TYPE hwm_device_online gauge\n")
-	b.WriteString("# HELP hwm_device_consecutive_failures Consecutive polling failures per device\n")
-	b.WriteString("# TYPE hwm_device_consecutive_failures gauge\n")
-	for _, st := range s.Statuses() {
+	statuses := s.Statuses()
+	for _, st := range statuses {
 		online := 0
 		if st.State == "online" {
 			online = 1
 		}
-		fmt.Fprintf(&b, "hwm_device_online{device=%q,state=%q} %d\n", st.Name, st.State, online)
-		fmt.Fprintf(&b, "hwm_device_consecutive_failures{device=%q} %d\n", st.Name, st.ConsecutiveFailures)
+		fmt.Fprintf(&b, "hwm_device_online{device=%s,state=%s} %d\n", metricLabel(st.Name), metricLabel(string(st.State)), online)
+	}
+	b.WriteString("# HELP hwm_device_consecutive_failures Consecutive polling failures per device\n")
+	b.WriteString("# TYPE hwm_device_consecutive_failures gauge\n")
+	for _, st := range statuses {
+		fmt.Fprintf(&b, "hwm_device_consecutive_failures{device=%s} %d\n", metricLabel(st.Name), st.ConsecutiveFailures)
 	}
 
 	// 2. Latest sensor readings (temperature & humidity)
 	since := time.Now().Add(-15 * time.Second)
 	sensorOnline := false
-	for _, st := range s.Statuses() {
+	for _, st := range statuses {
 		if st.Name == "sensor" && st.State == "online" && time.Since(st.LastSeen) < 15*time.Second {
 			sensorOnline = true
 		}
@@ -39,12 +48,12 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if temps, err := s.Store.Measurements(ctx, "sensor", "temperature_c", since, 1); sensorOnline && err == nil && len(temps) > 0 {
 		b.WriteString("# HELP hwm_sensor_temperature_celsius Latest ambient temperature in Celsius\n")
 		b.WriteString("# TYPE hwm_sensor_temperature_celsius gauge\n")
-		fmt.Fprintf(&b, "hwm_sensor_temperature_celsius{source=%q} %.2f\n", temps[0].Source, temps[0].Value)
+		fmt.Fprintf(&b, "hwm_sensor_temperature_celsius{source=%s} %.2f\n", metricLabel(temps[0].Source), temps[0].Value)
 	}
 	if humids, err := s.Store.Measurements(ctx, "sensor", "humidity_pct", since, 1); sensorOnline && err == nil && len(humids) > 0 {
 		b.WriteString("# HELP hwm_sensor_humidity_percent Latest relative humidity percentage\n")
 		b.WriteString("# TYPE hwm_sensor_humidity_percent gauge\n")
-		fmt.Fprintf(&b, "hwm_sensor_humidity_percent{source=%q} %.2f\n", humids[0].Source, humids[0].Value)
+		fmt.Fprintf(&b, "hwm_sensor_humidity_percent{source=%s} %.2f\n", metricLabel(humids[0].Source), humids[0].Value)
 	}
 
 	// 3. Relay channel states (read-back confirmed)
@@ -56,7 +65,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			if ch.On {
 				val = 1
 			}
-			fmt.Fprintf(&b, "hwm_relay_channel_state{channel=\"%d\",label=%q} %d\n", ch.ID, ch.Label, val)
+			fmt.Fprintf(&b, "hwm_relay_channel_state{channel=\"%d\",label=%s} %d\n", ch.ID, metricLabel(ch.Label), val)
 		}
 	}
 
