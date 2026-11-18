@@ -13,6 +13,7 @@ import (
 type Thermocouple struct {
 	URL      string
 	Timeout  time.Duration
+	ioMu     sync.Mutex
 	mu       sync.Mutex
 	c        *modbus.ModbusClient
 	channels [4]ThermocoupleChannel
@@ -20,8 +21,8 @@ type Thermocouple struct {
 }
 
 func (t *Thermocouple) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.ioMu.Lock()
+	defer t.ioMu.Unlock()
 	if t.c != nil {
 		_ = t.c.Close()
 		t.c = nil
@@ -29,16 +30,20 @@ func (t *Thermocouple) Close() error {
 	return nil
 }
 func (t *Thermocouple) Read(ctx context.Context) ([]Measurement, error) {
+	commit, err := t.readStaged(ctx)
+	if err != nil {
+		t.Invalidate()
+		return nil, err
+	}
+	return commit(), nil
+}
+
+func (t *Thermocouple) readStaged(ctx context.Context) (func() []Measurement, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	defer func() {
-		if time.Since(t.observed) > t.Timeout {
-			t.unknownLocked()
-		}
-	}()
+	t.ioMu.Lock()
+	defer t.ioMu.Unlock()
 	if t.c == nil {
 		c, err := modbus.NewClient(&modbus.ClientConfiguration{URL: t.URL, Timeout: t.Timeout})
 		if err != nil {
@@ -55,7 +60,12 @@ func (t *Thermocouple) Read(ctx context.Context) ([]Measurement, error) {
 		t.c = nil
 		return nil, fmt.Errorf("thermocouple FC4: %w", err)
 	}
-	return t.decode(regs, time.Now()), nil
+	now := time.Now()
+	return func() []Measurement {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		return t.decode(regs, now)
+	}, nil
 }
 
 type ThermocoupleChannel struct {

@@ -68,15 +68,18 @@ type SpeedControl interface {
 	Status(context.Context) (speed.State, error)
 }
 type Options struct {
-	Speed     SpeedControl
-	Switch    Switch
-	FanReader FanReader
-	Recorder  Recorder
-	Store     Persistence
-	Log       *slog.Logger
-	Channels  int           // relay channels in use (validates fan_channel)
-	MaxAge    time.Duration // readings older than this are not acted on
-	Now       func() time.Time
+	Speed           SpeedControl
+	Switch          Switch
+	FanReader       FanReader
+	Recorder        Recorder
+	Store           Persistence
+	Log             *slog.Logger
+	Channels        int           // relay channels in use (validates fan_channel)
+	MaxAge          time.Duration // readings older than this are not acted on
+	Now             func() time.Time
+	RelayAvailable  func() bool
+	SpeedAvailable  func() bool
+	SensorAvailable func() bool
 }
 
 // Engine consumes temperature readings and drives the fan relay.
@@ -88,18 +91,21 @@ type Options struct {
 //     write is retried on the next reading, never assumed to have happened.
 //   - Inside the band with unknown state, the hardware is left untouched.
 type Engine struct {
-	speed         SpeedControl
-	speedFailing  bool
-	invalidBefore time.Time
-	sampleCancel  context.CancelFunc // guarded by mu
-	sw            Switch
-	fanReader     FanReader
-	rec           Recorder
-	db            Persistence
-	log           *slog.Logger
-	channels      int
-	maxAge        time.Duration
-	now           func() time.Time
+	speed           SpeedControl
+	relayAvailable  func() bool
+	speedAvailable  func() bool
+	sensorAvailable func() bool
+	speedFailing    bool
+	invalidBefore   time.Time
+	sampleCancel    context.CancelFunc // guarded by mu
+	sw              Switch
+	fanReader       FanReader
+	rec             Recorder
+	db              Persistence
+	log             *slog.Logger
+	channels        int
+	maxAge          time.Duration
+	now             func() time.Time
 
 	operationMu sync.Mutex // serialises mode switches against automatic actuations
 
@@ -126,6 +132,7 @@ func New(o Options) *Engine {
 	}
 	return &Engine{
 		speed: o.Speed, sw: o.Switch, fanReader: o.FanReader, rec: o.Recorder, db: o.Store, log: o.Log.With("component", "control"),
+		relayAvailable: o.RelayAvailable, speedAvailable: o.SpeedAvailable, sensorAvailable: o.SensorAvailable,
 		channels: o.Channels, maxAge: o.MaxAge, now: o.Now,
 		cfg: DefaultConfig(), latest: make(chan Reading, 1),
 	}
@@ -340,6 +347,10 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 		e.suspend(ctx, fmt.Sprintf("reading unavailable or stale (%s old)", e.now().Sub(r.At).Round(time.Millisecond)))
 		return
 	}
+	if e.relayAvailable != nil && !e.relayAvailable() {
+		e.suspend(ctx, "relay unavailable")
+		return
+	}
 
 	// Re-read physical feedback before deciding. An external Modbus client or
 	// simulator restart may have changed the coil without going through our API.
@@ -392,6 +403,10 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 		e.suspend(ctx, "reading expired or invalidated before relay write")
 		return
 	}
+	if e.relayAvailable != nil && !e.relayAvailable() {
+		e.suspend(ctx, "relay unavailable before write")
+		return
+	}
 	if err := e.sw.SetChannel(sampleCtx, cfg.FanChannel, want); err != nil {
 		e.log.Warn("fan write failed", "want", want, "err", err)
 		e.mu.Lock()
@@ -442,11 +457,15 @@ func SpeedTarget(temp float64) int {
 }
 func (e *Engine) sampleCurrent(ctx context.Context, at time.Time) bool {
 	age := e.now().Sub(at)
-	return ctx.Err() == nil && !at.IsZero() && age >= 0 && age <= e.maxAge
+	return ctx.Err() == nil && !at.IsZero() && age >= 0 && age <= e.maxAge &&
+		(e.sensorAvailable == nil || e.sensorAvailable())
 }
 
 func (e *Engine) applySpeed(ctx, sampleCtx context.Context, reading Reading, on bool) {
 	if e.speed == nil || !e.sampleCurrent(sampleCtx, reading.At) {
+		return
+	}
+	if e.speedAvailable != nil && !e.speedAvailable() {
 		return
 	}
 	target := 0
@@ -460,6 +479,9 @@ func (e *Engine) applySpeed(ctx, sampleCtx context.Context, reading Reading, on 
 	}
 	changed := false
 	if err == nil && int(st.CommandPct) != target {
+		if e.speedAvailable != nil && !e.speedAvailable() {
+			return
+		}
 		changed = true
 		_, err = e.speed.Set(sampleCtx, target)
 	}

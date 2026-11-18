@@ -60,6 +60,8 @@ type Server struct {
 	Log          *slog.Logger
 }
 
+var errDeviceRecovering = errors.New("device recovering")
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -250,19 +252,30 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRelays(w http.ResponseWriter, r *http.Request) {
-	if !s.deviceAvailable("relay") {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	chs, err := s.readRelayChannels(ctx)
+	if errors.Is(err, errDeviceRecovering) {
 		writeErr(w, 503, "device_recovering")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	chs, err := s.Relays.Channels(ctx)
 	if err != nil {
 		s.Log.Warn("read relays", "err", err)
 		writeErr(w, http.StatusBadGateway, "device_unreachable")
 		return
 	}
 	writeJSON(w, http.StatusOK, chs)
+}
+
+func (s *Server) readRelayChannels(ctx context.Context) ([]relay.Channel, error) {
+	if !s.deviceAvailable("relay") {
+		return nil, errDeviceRecovering
+	}
+	channels, err := s.Relays.Channels(ctx)
+	if !s.deviceAvailable("relay") {
+		return nil, errDeviceRecovering
+	}
+	return channels, err
 }
 
 func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
@@ -286,7 +299,7 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 	var errWrite error
 	write := func() error {
 		if !s.deviceAvailable("relay") {
-			return errors.New("device recovering")
+			return errDeviceRecovering
 		}
 		res, errWrite = s.Relays.Set(ctx, id, *req.On)
 		if errWrite == nil {
@@ -317,6 +330,8 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 	status, code := http.StatusOK, "ok"
 	switch {
 	case err == nil:
+	case errors.Is(err, errDeviceRecovering):
+		status, code = http.StatusServiceUnavailable, "device_recovering"
 	case errors.Is(err, relay.ErrInvalidChannel):
 		status, code = http.StatusNotFound, "invalid_channel"
 	case errors.Is(err, relay.ErrReadBackMismatch):
@@ -392,6 +407,10 @@ func (s *Server) getSpeed(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	st, err := s.Speed.Status(ctx)
+	if !s.deviceAvailable("fan_speed") {
+		writeErr(w, 503, "device_recovering")
+		return
+	}
 	if err != nil {
 		writeErr(w, 502, "device_unreachable")
 		return
@@ -399,10 +418,6 @@ func (s *Server) getSpeed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
-	if !s.deviceAvailable("fan_speed") {
-		writeErr(w, 503, "device_recovering")
-		return
-	}
 	if s.Speed == nil {
 		writeErr(w, 503, "speed_unavailable")
 		return
@@ -418,7 +433,14 @@ func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	var st speed.State
-	perform := func() error { var err error; st, err = s.Speed.Set(ctx, *req.Percent); return err }
+	perform := func() error {
+		if !s.deviceAvailable("fan_speed") {
+			return errDeviceRecovering
+		}
+		var err error
+		st, err = s.Speed.Set(ctx, *req.Percent)
+		return err
+	}
 	var err error
 	if ctl, ok := s.Control.(interface{ ManualSpeedOperation(func() error) error }); ok {
 		err = ctl.ManualSpeedOperation(perform)
@@ -429,6 +451,10 @@ func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, control.ErrFanAutoMode) {
 		writeErr(w, 409, "fan_in_auto_mode_switch_to_manual_first")
+		return
+	}
+	if errors.Is(err, errDeviceRecovering) {
+		writeErr(w, 503, "device_recovering")
 		return
 	}
 	claims, _ := auth.ClaimsFrom(r.Context())
@@ -450,10 +476,13 @@ func (s *Server) getThermocouple(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "thermocouple_unavailable")
 		return
 	}
-	if !s.deviceAvailable("thermocouple") {
-		s.Thermocouple.Invalidate()
-	}
 	channels := s.Thermocouple.Channels()
+	if !s.deviceAvailable("thermocouple") {
+		for i := range channels {
+			channels[i].Status = "unknown"
+			channels[i].Temperature = nil
+		}
+	}
 	all := true
 	for _, ch := range channels {
 		if ch.Status != "fault" {

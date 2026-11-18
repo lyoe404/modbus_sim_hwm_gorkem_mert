@@ -6,6 +6,12 @@ import { LiveChart } from './LiveChart';
 import { ExtendedPanels } from './ExtendedPanels';
 import { ThermocoupleSnapshot, SpeedState, AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
 
+function resetTargetForDevice(name: string) {
+  if (name === 'sensor') return 'temp-humidity';
+  if (name === 'fan_speed') return 'speed-pwm';
+  return name;
+}
+
 export function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('hwm_token'));
   const [me, setMe] = useState<UserMe | null>(null);
@@ -19,7 +25,8 @@ export function App() {
   const speedRevision = useRef(0);
   const relaySnapshots = useRef(createSnapshotGuard());
   const controlRevision = useRef(0);
-  const resetEpoch = useRef<Record<string,number>>({});
+  const resetEpoch = useRef<Record<string, number>>({});
+  const resetPending = useRef(new Set<string>());
   const [resetting, setResetting] = useState<Record<string,boolean>>({});
   const [thermoAt, setThermoAt] = useState(0);
  const [speedAt,setSpeedAt]=useState(0);
@@ -108,18 +115,47 @@ export function App() {
         const speedVersion = speedRevision.current;
         const controlVersion = controlRevision.current;
         const relayVersion = relaySnapshots.current.capture();
+        const resetVersion = { ...resetEpoch.current };
+        const pendingResets = new Set(resetPending.current);
+        const acceptsResetSnapshot = (target: string) =>
+          !signal.aborted && !pendingResets.has(target) && resetVersion[target] === resetEpoch.current[target];
 
-        if (hasPerm('read:thermocouple')) tasks.push(api.thermocouple(token,signal).then(value=>{if(!signal.aborted){setThermocouple(value);setThermoAt(Date.now());}}).catch(err=>{if(!signal.aborted)setThermocouple(null);if(err instanceof ApiError && err.status===401)throw err;}));
-        if (hasPerm('read:fan_speed')) tasks.push(api.speed(token,signal).then(value=>{if(!signal.aborted && speedVersion === speedRevision.current){setSpeed(value);setSpeedAt(Date.now());}}).catch(err=>{if(!signal.aborted && speedVersion === speedRevision.current)setSpeed(null);if(err instanceof ApiError && err.status===401)throw err;}));
+        if (hasPerm('read:thermocouple')) {
+          tasks.push(api.thermocouple(token, signal).then(value => {
+            if (!acceptsResetSnapshot('thermocouple')) return;
+            setThermocouple(value);
+            setThermoAt(Date.now());
+          }).catch(error => {
+            if (acceptsResetSnapshot('thermocouple')) setThermocouple(null);
+            if (error instanceof ApiError && error.status === 401) throw error;
+          }));
+        }
+        if (hasPerm('read:fan_speed')) {
+          const acceptsSpeed = () =>
+            acceptsResetSnapshot('speed-pwm') && speedVersion === speedRevision.current;
+          tasks.push(api.speed(token, signal).then(value => {
+            if (!acceptsSpeed()) return;
+            setSpeed(value);
+            setSpeedAt(Date.now());
+          }).catch(error => {
+            if (acceptsSpeed()) setSpeed(null);
+            if (error instanceof ApiError && error.status === 401) throw error;
+          }));
+        }
         if (hasPerm('read:device_status')) {
           tasks.push(api.devices(token, signal).then(value => {
             if (signal.aborted) return;
-            setDevices(value);
+            setDevices(previous => value.map(device => {
+              if (acceptsResetSnapshot(resetTargetForDevice(device.name))) return device;
+              return previous.find(item => item.name === device.name) ?? {
+                name: device.name, state: 'recovering', consecutive_failures: 0,
+              };
+            }));
             setResetting(previous => {
               const next = { ...previous };
               for (const device of value) {
-                const target = device.name === 'sensor' ? 'temp-humidity' : device.name === 'fan_speed' ? 'speed-pwm' : device.name;
-                if (device.state === 'online' && Date.parse(device.last_seen ?? '') > (resetEpoch.current[target] ?? 0)) delete next[target];
+                const target = resetTargetForDevice(device.name);
+                if (device.state === 'online' && acceptsResetSnapshot(target)) delete next[target];
               }
               return next;
             });
@@ -163,6 +199,7 @@ export function App() {
             api.getControl(token, signal).then((snap) => {
               if (signal.aborted) return;
               if (controlVersion !== controlRevision.current) return;
+              if (!acceptsResetSnapshot('relay') || !acceptsResetSnapshot('temp-humidity')) return;
               setControl(snap);
               setOnAboveInput((prev) => (document.activeElement?.id === 'on_above' ? prev : String(snap.config.on_above)));
               setOffBelowInput((prev) => (document.activeElement?.id === 'off_below' ? prev : String(snap.config.off_below)));
@@ -353,6 +390,7 @@ export function App() {
 
   const canWriteRelay = hasPerm('write:relay');
   const relayDeviceOnline = !resetting.relay && devices.some(d => d.name === 'relay' && d.state === 'online');
+  const pwmResetVersion = resetEpoch.current['speed-pwm'];
   const sensorDeviceOnline = devices.some(d => d.name === 'sensor' && d.state === 'online');
   const canWriteThresholds = hasPerm('write:thresholds');
   const sensorLatestAt = Math.max(0, ...[temps[temps.length - 1], humids[humids.length - 1]]
@@ -475,7 +513,7 @@ export function App() {
                   {control.suspended
                     ? 'SUSPENDED (Stale/Offline)'
                     : control.config.enabled
-                    ? `AUTO (${control.fan_on === null ? 'UNKNOWN' : control.fan_on ? 'FAN ON' : 'FAN OFF'})`
+                    ? `AUTO (${!relayDeviceOnline || resetting['temp-humidity'] || control.fan_on === null ? 'UNKNOWN' : control.fan_on ? 'FAN ON' : 'FAN OFF'})`
                     : 'MANUAL (AUTO OFF)'}
                 </div>
                 <div className="text-xs text-slate-400 mt-0.5">
@@ -724,23 +762,30 @@ export function App() {
             pollAll();
           }}
           onSpeed={value => {
+            if (pwmResetVersion !== resetEpoch.current['speed-pwm'] || resetPending.current.has('speed-pwm')) return;
             speedRevision.current++;
             setSpeed(value);
             setSpeedAt(Date.now());
             pollAll();
           }}
           onReset={async target => {
-            resetEpoch.current[target] = Infinity;
+            resetEpoch.current[target] = (resetEpoch.current[target] ?? 0) + 1;
+            resetPending.current.add(target);
             const relayReset = target === 'relay' ? relaySnapshots.current.begin() : undefined;
             setResetting(previous => ({ ...previous, [target]: true }));
-            if (target === 'temp-humidity') { setTemps([]); setHumids([]); setSensorFetchFailed(true); }
+            setDevices(previous => previous.map(device => resetTargetForDevice(device.name) === target
+              ? { name: device.name, state: 'recovering', consecutive_failures: 0 }
+              : device));
+            if (target === 'relay' || target === 'temp-humidity') {
+              setControl(previous => previous && { ...previous, fan_on: null });
+            }
             if (target === 'relay') setRelays([]);
             if (target === 'thermocouple') setThermocouple(null);
             if (target === 'speed-pwm') { speedRevision.current++; setSpeed(null); }
             try {
               await api.reset(token, target);
             } finally {
-              resetEpoch.current[target] = Date.now();
+              resetPending.current.delete(target);
               relayReset?.finish();
               pollAll();
             }

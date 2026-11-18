@@ -57,7 +57,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Relay channel states (read-back confirmed)
-	if chs, err := s.Relays.Channels(ctx); err == nil {
+	if chs, err := s.readRelayChannels(ctx); err == nil {
 		b.WriteString("# HELP hwm_relay_channel_state Current read-back state of relay channels (1=ON, 0=OFF)\n")
 		b.WriteString("# TYPE hwm_relay_channel_state gauge\n")
 		for _, ch := range chs {

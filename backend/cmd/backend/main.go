@@ -104,23 +104,35 @@ func run(log *slog.Logger) error {
 	speedControl := &speed.Controller{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}
 	defer speedControl.Close()
 
+	pwm := poller.New(poller.Config{Name: "fan_speed", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
+		&poller.SpeedReader{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}, db, log, deviceEvent(db, log))
+	relayHealth := poller.New(poller.Config{Name: "relay", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
+		relayReader{controller: relays}, noopSink{}, log, deviceEvent(db, log))
+	var sensorPoller *poller.Poller
 	// Rules engine: reads fresh temperatures, drives the fan relay, thresholds live in the DB.
 	engine := control.New(control.Options{
-		Speed:     speedControl,
-		Switch:    relaySwitch(relays),
-		FanReader: fanCoilReader{controller: relays},
-		Recorder:  eventRecorder(db),
-		Store:     db,
-		Log:       log,
-		Channels:  len(labels),
-		MaxAge:    3 * pollInterval, // never act on a reading older than three polls
+		Speed:           speedControl,
+		Switch:          relaySwitch(relays),
+		FanReader:       fanCoilReader{controller: relays},
+		Recorder:        eventRecorder(db),
+		Store:           db,
+		Log:             log,
+		Channels:        len(labels),
+		MaxAge:          3 * pollInterval, // never act on a reading older than three polls
+		RelayAvailable:  func() bool { return relayHealth.Status().State == poller.StateOnline },
+		SpeedAvailable:  func() bool { return pwm.Status().State == poller.StateOnline },
+		SensorAvailable: func() bool { return sensorPoller.Status().State == poller.StateOnline },
 	})
 	if err := engine.Load(ctx); err != nil {
 		return err
 	}
 
 	var resetAuditMu sync.Mutex
-	resetActors := make(map[string]string)
+	type resetAudit struct {
+		target, actor  string
+		reportedFailed bool
+	}
+	resetAudits := make(map[string]resetAudit)
 	// Persist each observed device health snapshot, including repeated failures and
 	// last-seen time. Do not use persisted online statuses to drive automation.
 	persistStatus := func(st poller.DeviceStatus) {
@@ -129,15 +141,21 @@ func run(log *slog.Logger) error {
 		if err := db.SaveDeviceStatus(dbCtx, st); err != nil && ctx.Err() == nil {
 			log.Error("persist device health", "device", st.Name, "err", err)
 		}
-		if st.State == poller.StateOnline {
+		if st.State == poller.StateOnline || st.State == poller.StateRecoveryFailed {
 			resetAuditMu.Lock()
-			by, ok := resetActors[st.Name]
-			if ok {
-				delete(resetActors, st.Name)
+			entry, pending := resetAudits[st.Name]
+			message := ""
+			if pending && st.State == poller.StateOnline {
+				delete(resetAudits, st.Name)
+				message = "recovered after fresh verified read"
+			} else if pending && !entry.reportedFailed {
+				entry.reportedFailed = true
+				resetAudits[st.Name] = entry
+				message = "recovery failed"
 			}
 			resetAuditMu.Unlock()
-			if ok {
-				if err := db.AddEvent(dbCtx, store.Event{Kind: "device_reset", Source: st.Name, Actor: by, Message: "recovered after fresh verified read"}); err != nil {
+			if message != "" {
+				if err := db.AddEvent(dbCtx, store.Event{Kind: "device_reset", Source: entry.target, Actor: entry.actor, Message: message}); err != nil {
 					log.Error("reset recovery audit", "err", err)
 				}
 			}
@@ -164,7 +182,7 @@ func run(log *slog.Logger) error {
 		URL:     modbusURL,
 		Timeout: 2 * time.Second,
 	}
-	p := poller.New(
+	sensorPoller = poller.New(
 		poller.Config{
 			Name:     sensorSource,
 			Interval: pollInterval,
@@ -176,16 +194,11 @@ func run(log *slog.Logger) error {
 	thermoReader := &poller.Thermocouple{URL: env("THERMOCOUPLE_MODBUS_URL", "tcp://thermocouple-sim:5023"), Timeout: 2 * time.Second}
 	thermo := poller.New(poller.Config{Name: "thermocouple", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
 		thermoReader, db, log, deviceEvent(db, log))
-	pwm := poller.New(poller.Config{Name: "fan_speed", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
-		&poller.SpeedReader{URL: env("SPEED_MODBUS_URL", "tcp://speed-pwm-sim:5024"), Timeout: 2 * time.Second}, db, log, deviceEvent(db, log))
-	// Read-only relay health polling does not interfere with writes.
-	relayHealth := poller.New(poller.Config{Name: "relay", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
-		relayReader{controller: relays}, noopSink{}, log, deviceEvent(db, log))
-	for _, current := range []*poller.Poller{p, relayHealth, thermo, pwm} {
+	for _, current := range []*poller.Poller{sensorPoller, relayHealth, thermo, pwm} {
 		current.SetOnPoll(persistStatus)
 	}
 	resetClient := &reset.Client{Addr: env("RESET_TCP_ADDR", "remote-reset-sim:9001"), Timeout: 4 * time.Second}
-	targets := map[string]*poller.Poller{"temp-humidity": p, "relay": relayHealth, "thermocouple": thermo, "speed-pwm": pwm}
+	targets := map[string]*poller.Poller{"temp-humidity": sensorPoller, "relay": relayHealth, "thermocouple": thermo, "speed-pwm": pwm}
 	resetDevice := func(ctx context.Context, target string) error {
 		return engine.ResetOperation(func() error {
 			// Invalidate before sending: a lost acknowledgement may still mean reset occurred.
@@ -207,11 +220,8 @@ func run(log *slog.Logger) error {
 				deviceName = "fan_speed"
 			}
 			resetAuditMu.Lock()
-			resetActors[deviceName] = claims.Username
+			resetAudits[deviceName] = resetAudit{target: target, actor: claims.Username}
 			resetAuditMu.Unlock()
-			if target == "thermocouple" {
-				thermoReader.Invalidate()
-			}
 			_, err := resetClient.Command(ctx, "RESET", target)
 			close(ready)
 			return err
@@ -222,7 +232,7 @@ func run(log *slog.Logger) error {
 		Handler: (&api.Server{
 			Tokens: tokens, Users: users, Store: db, Relays: relays, Control: engine, Speed: speedControl, Thermocouple: thermoReader, ResetDevice: resetDevice,
 			Statuses: func() []poller.DeviceStatus {
-				return []poller.DeviceStatus{p.Status(), relayHealth.Status(), thermo.Status(), pwm.Status()}
+				return []poller.DeviceStatus{sensorPoller.Status(), relayHealth.Status(), thermo.Status(), pwm.Status()}
 			},
 			Log: log,
 		}).Handler(),
@@ -234,7 +244,7 @@ func run(log *slog.Logger) error {
 
 	var wg sync.WaitGroup
 	wg.Add(6)
-	go func() { defer wg.Done(); p.Run(ctx) }()
+	go func() { defer wg.Done(); sensorPoller.Run(ctx) }()
 	go func() { defer wg.Done(); relayHealth.Run(ctx) }()
 	go func() { defer wg.Done(); thermo.Run(ctx) }()
 	go func() { defer wg.Done(); pwm.Run(ctx) }()

@@ -31,10 +31,12 @@ type Sink interface {
 type State string
 
 const (
-	StateUnknown  State = "unknown"  // nothing polled yet
-	StateOnline   State = "online"   // last poll succeeded
-	StateDegraded State = "degraded" // recent failures, still retrying
-	StateOffline  State = "offline"  // repeated failures
+	StateUnknown        State = "unknown"  // nothing polled yet
+	StateOnline         State = "online"   // last poll succeeded
+	StateDegraded       State = "degraded" // recent failures, still retrying
+	StateOffline        State = "offline"  // repeated failures
+	StateRecovering     State = "recovering"
+	StateRecoveryFailed State = "recovery_failed"
 )
 
 // DeviceStatus is a point-in-time view of a device's connectivity.

@@ -195,3 +195,35 @@ func TestSensorLossDuringPWMFeedbackPreventsWrite(t *testing.T) {
 		t.Fatal("pre-fault sample reached the PWM device")
 	}
 }
+
+func TestAutoGatesRelayAndPWMUntilVerifiedRecovery(t *testing.T) {
+	h := newHarness()
+	pwm := &pwmFake{}
+	h.e.speed = pwm
+	relayOnline, pwmOnline := false, false
+	h.e.relayAvailable = func() bool { return relayOnline }
+	h.e.speedAvailable = func() bool { return pwmOnline }
+	var reads int
+	h.e.fanReader = fanReaderFunc(func(context.Context, int) (bool, error) {
+		reads++
+		return h.sw.count() > 0, nil
+	})
+	if err := h.e.ResetOperation(func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(time.Second)
+	h.feed(35)
+	if reads != 0 || h.sw.count() != 0 || pwm.writes != 0 {
+		t.Fatal("AUTO reached recovering hardware")
+	}
+	relayOnline = true
+	h.feed(35)
+	if h.sw.count() != 1 || pwm.writes != 0 {
+		t.Fatal("relay should resume independently of recovering PWM")
+	}
+	pwmOnline = true
+	h.feed(35)
+	if pwm.writes != 1 || pwm.pct != 100 {
+		t.Fatal("PWM did not resume on verified recovery")
+	}
+}
