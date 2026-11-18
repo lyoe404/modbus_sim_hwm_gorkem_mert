@@ -99,6 +99,9 @@ func (s *Controller) Set(ctx context.Context, pct int) (State, error) {
 	if err := s.connect(); err != nil {
 		return State{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return State{}, err
+	}
 	if err := s.c.WriteRegister(0, uint16(pct)); err != nil {
 		s.closeLocked()
 		return State{}, fmt.Errorf("speed write: %w", err)

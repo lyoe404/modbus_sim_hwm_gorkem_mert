@@ -107,3 +107,91 @@ func TestManualSpeedSerializesModeChange(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type fanReaderFunc func(context.Context, int) (bool, error)
+
+func (f fanReaderFunc) ReadFan(ctx context.Context, channel int) (bool, error) {
+	return f(ctx, channel)
+}
+
+type slowPWM struct {
+	pwmFake
+	started, release chan struct{}
+}
+
+func (f *slowPWM) Status(context.Context) (speed.State, error) {
+	close(f.started)
+	<-f.release
+	return speed.State{}, nil
+}
+
+func TestSensorLossInvalidatesQueuedAndInFlightRelayWork(t *testing.T) {
+	for _, queued := range []bool{true, false} {
+		name := "in-flight feedback"
+		if queued {
+			name = "queued sample"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness()
+			started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			h.e.fanReader = fanReaderFunc(func(context.Context, int) (bool, error) {
+				close(started)
+				<-release
+				return false, nil
+			})
+			old := Reading{TempC: 35, At: h.now}
+			h.e.Observe(old)
+			if queued {
+				h.e.OnStatus(t.Context(), false)
+			}
+			go func() { defer close(done); h.e.step(t.Context(), <-h.e.latest) }()
+			if !queued {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("fan feedback did not start")
+				}
+				h.e.OnStatus(t.Context(), false)
+			}
+			close(release)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("step did not finish")
+			}
+			if h.sw.count() != 0 || !h.e.Snapshot().Suspended {
+				t.Fatal("pre-fault sample acted or resumed control")
+			}
+			h.now = h.now.Add(time.Second)
+			h.e.fanReader = nil
+			h.feed(35)
+			if h.sw.count() != 1 || h.e.Snapshot().Suspended {
+				t.Fatal("fresh reading did not resume AUTO")
+			}
+		})
+	}
+}
+
+func TestSensorLossDuringPWMFeedbackPreventsWrite(t *testing.T) {
+	h := newHarness()
+	h.e.ObserveManualRelay(0, true)
+	pwm := &slowPWM{started: make(chan struct{}), release: make(chan struct{})}
+	h.e.speed = pwm
+	done := make(chan struct{})
+	go func() { defer close(done); h.feed(35) }()
+	select {
+	case <-pwm.started:
+	case <-time.After(time.Second):
+		t.Fatal("PWM feedback did not start")
+	}
+	h.e.OnStatus(t.Context(), false)
+	close(pwm.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("step did not finish")
+	}
+	if pwm.writes != 0 {
+		t.Fatal("pre-fault sample reached the PWM device")
+	}
+}

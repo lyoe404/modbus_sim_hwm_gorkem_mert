@@ -149,6 +149,7 @@ func run(log *slog.Logger) error {
 	onChange := func(s poller.DeviceStatus) {
 		ectx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+		engine.OnStatus(ectx, s.State == poller.StateOnline)
 		msg := fmt.Sprintf("state=%s consecutive_failures=%d", s.State, s.ConsecutiveFailures)
 		if s.LastError != "" {
 			msg += " last_error=" + s.LastError
@@ -156,7 +157,6 @@ func run(log *slog.Logger) error {
 		if err := db.AddEvent(ectx, store.Event{Kind: "status_change", Source: s.Name, Message: msg}); err != nil {
 			log.Error("write event failed", "err", err)
 		}
-		engine.OnStatus(ectx, s.State == poller.StateOnline)
 	}
 
 	sensor := &poller.ModbusSensor{

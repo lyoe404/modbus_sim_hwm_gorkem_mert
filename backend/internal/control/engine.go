@@ -91,6 +91,7 @@ type Engine struct {
 	speed         SpeedControl
 	speedFailing  bool
 	invalidBefore time.Time
+	sampleCancel  context.CancelFunc // guarded by mu
 	sw            Switch
 	fanReader     FanReader
 	rec           Recorder
@@ -243,6 +244,12 @@ func (e *Engine) Observe(r Reading) {
 // online the engine suspends: no decision is made until a fresh reading arrives.
 func (e *Engine) OnStatus(ctx context.Context, online bool) {
 	if !online {
+		e.mu.Lock()
+		e.invalidBefore = e.now()
+		if e.sampleCancel != nil {
+			e.sampleCancel()
+		}
+		e.mu.Unlock()
 		e.suspend(ctx, "sensor not online")
 	}
 }
@@ -306,10 +313,18 @@ func (e *Engine) suspend(ctx context.Context, reason string) {
 func (e *Engine) step(ctx context.Context, r Reading) {
 	e.operationMu.Lock()
 	defer e.operationMu.Unlock()
+	sampleCtx, cancel := context.WithTimeout(ctx, e.maxAge-e.now().Sub(r.At))
 	e.mu.Lock()
 	cfg, gen := e.cfg, e.gen
 	invalidBefore := e.invalidBefore
+	e.sampleCancel = cancel
 	e.mu.Unlock()
+	defer func() {
+		cancel()
+		e.mu.Lock()
+		e.sampleCancel = nil
+		e.mu.Unlock()
+	}()
 	if !cfg.Enabled {
 		return
 	}
@@ -318,11 +333,11 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	case math.IsNaN(r.TempC) || math.IsInf(r.TempC, 0) || r.TempC < MinPlausibleC || r.TempC > MaxPlausibleC:
 		e.suspend(ctx, fmt.Sprintf("implausible reading %v", r.TempC))
 		return
-	case r.At.Before(invalidBefore):
-		e.suspend(ctx, "reading predates reset")
+	case !r.At.After(invalidBefore):
+		e.suspend(ctx, "reading predates sensor invalidation")
 		return
-	case r.At.IsZero() || r.At.After(e.now()) || e.now().Sub(r.At) > e.maxAge:
-		e.suspend(ctx, fmt.Sprintf("stale reading (%s old)", e.now().Sub(r.At).Round(time.Millisecond)))
+	case !e.sampleCurrent(sampleCtx, r.At):
+		e.suspend(ctx, fmt.Sprintf("reading unavailable or stale (%s old)", e.now().Sub(r.At).Round(time.Millisecond)))
 		return
 	}
 
@@ -330,7 +345,7 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	// simulator restart may have changed the coil without going through our API.
 	// Inside the hysteresis band we preserve the *device's* state, not a guess.
 	if e.fanReader != nil {
-		actual, err := e.fanReader.ReadFan(ctx, cfg.FanChannel)
+		actual, err := e.fanReader.ReadFan(sampleCtx, cfg.FanChannel)
 		if err != nil {
 			e.suspend(ctx, fmt.Sprintf("fan feedback unavailable: %v", err))
 			return
@@ -349,6 +364,11 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	}
 
 	e.mu.Lock()
+	if !e.sampleCurrent(sampleCtx, r.At) {
+		e.mu.Unlock()
+		e.suspend(ctx, "reading expired or invalidated during fan feedback")
+		return
+	}
 	wasSuspended := e.suspended
 	e.suspended = false
 	cur := e.fanOn
@@ -364,11 +384,15 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	prev := cur != nil && *cur
 	want := NextFan(r.TempC, cfg.OnAbove, cfg.OffBelow, prev)
 	if cur != nil && *cur == want {
-		e.applySpeed(ctx, r.TempC, want)
+		e.applySpeed(ctx, sampleCtx, r, want)
 		return
 	}
 
-	if err := e.sw.SetChannel(ctx, cfg.FanChannel, want); err != nil {
+	if !e.sampleCurrent(sampleCtx, r.At) {
+		e.suspend(ctx, "reading expired or invalidated before relay write")
+		return
+	}
+	if err := e.sw.SetChannel(sampleCtx, cfg.FanChannel, want); err != nil {
 		e.log.Warn("fan write failed", "want", want, "err", err)
 		e.mu.Lock()
 		first := !e.actFailing
@@ -390,7 +414,7 @@ func (e *Engine) step(ctx context.Context, r Reading) {
 	e.actFailing = false
 	e.mu.Unlock()
 
-	e.applySpeed(ctx, r.TempC, want)
+	e.applySpeed(ctx, sampleCtx, r, want)
 	kind := "fan_transition"
 	if cur == nil {
 		kind = "fan_sync"
@@ -416,19 +440,28 @@ func onOff(b bool) string {
 func SpeedTarget(temp float64) int {
 	return int(math.Round(math.Max(0, math.Min(100, 20+(temp-25)*8))))
 }
-func (e *Engine) applySpeed(ctx context.Context, temp float64, on bool) {
-	if e.speed == nil {
+func (e *Engine) sampleCurrent(ctx context.Context, at time.Time) bool {
+	age := e.now().Sub(at)
+	return ctx.Err() == nil && !at.IsZero() && age >= 0 && age <= e.maxAge
+}
+
+func (e *Engine) applySpeed(ctx, sampleCtx context.Context, reading Reading, on bool) {
+	if e.speed == nil || !e.sampleCurrent(sampleCtx, reading.At) {
 		return
 	}
 	target := 0
 	if on {
-		target = SpeedTarget(temp)
+		target = SpeedTarget(reading.TempC)
 	}
-	st, err := e.speed.Status(ctx)
+	st, err := e.speed.Status(sampleCtx)
+	if !e.sampleCurrent(sampleCtx, reading.At) {
+		e.suspend(ctx, "reading expired or invalidated during PWM feedback")
+		return
+	}
 	changed := false
 	if err == nil && int(st.CommandPct) != target {
 		changed = true
-		_, err = e.speed.Set(ctx, target)
+		_, err = e.speed.Set(sampleCtx, target)
 	}
 	if err != nil {
 		if !e.speedFailing {
