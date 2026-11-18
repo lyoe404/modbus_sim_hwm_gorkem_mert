@@ -2,7 +2,7 @@
 
 **HWM Full-Stack Technical Assessment v3.1 — Go · React · Modbus TCP · SQLite · Prometheus · Grafana**
 
-A monitoring and control platform for independent simulated field devices. The device-facing backend is written in Go: it polls real Modbus TCP sockets, stores measurements, evaluates temperature-based hysteresis, verifies physical relay/PWM feedback, exposes authenticated control APIs, and exports Prometheus metrics. A React frontend provides live views and controls; a separate TCP reset simulator supports power-cycle workflows. The whole stack is described by Docker Compose.
+An end-to-end monitoring and control platform for independent simulated industrial devices. The device-facing backend is written in Go: it polls real Modbus TCP sockets, stores measurements, evaluates temperature-based hysteresis, verifies physical relay/PWM feedback, exposes authenticated control APIs, and exports Prometheus metrics. A React frontend provides live views and controls; a separate TCP reset simulator supports power-cycle workflows. The whole stack is described by Docker Compose.
 
 ## 1. Quick start
 
@@ -23,24 +23,13 @@ PowerShell equivalent for the first command:
 
 ```powershell
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
-// OR JUST COPY .env.example ctx -> .env  // 
 ```
 
 Do not overwrite an existing `.env`. Wait for health checks to settle; simulator dependencies are health-gated. Inspect failures with `docker compose logs --tail=100 backend` or `docker compose logs --tail=100 <service>`.
 
-| Component | Default host address | Notes |
-|---|---|---|
-| React application | http://localhost:3000 | Nginx proxies `/api/`, `/healthz`, and a limited Prometheus query path |
-| Go backend | http://localhost:8080 | `/healthz`, `/metrics`, and `/api/*` |
-| Prometheus | http://localhost:9090/targets | `hwm-backend` should be UP |
-| Grafana | http://localhost:3001 | Dashboard UID `hwm-industrial-overview` |
-| Sensor fault admin | http://127.0.0.1:5121 | Test-only, unauthenticated |
-| Relay fault admin | http://127.0.0.1:5122 | Test-only, unauthenticated |
-| Thermocouple fault admin | http://127.0.0.1:5123 | Test-only, unauthenticated |
-| PWM fault admin | http://127.0.0.1:5124 | Test-only, unauthenticated |
-| Remote-reset TCP | 127.0.0.1:9001 | Line-oriented protocol; not an HTTP endpoint |
+Open the [React application](http://localhost:3000), [Grafana dashboard](http://localhost:3001/d/hwm-industrial-overview), or [Prometheus targets](http://localhost:9090/targets). For the complete host/container port map and device interfaces, see [System architecture](#2-system-architecture).
 
-The Modbus ports (`5021`–`5024`) are reachable **inside the Compose network**, not directly published to the host. The backend, frontend, Prometheus, and Grafana host port mappings are configurable but not restricted to loopback by default; **do not expose this demo configuration to an untrusted network**.
+**Security:** The demo Compose stack is intended for a trusted local network. Backend, frontend, Prometheus and Grafana host bindings are not restricted to loopback by default. Device admin HTTP and reset TCP ports are loopback-only.
 
 To stop without destroying persistent measurements/monitoring data:
 
@@ -52,178 +41,165 @@ docker compose down
 
 ### Demo credentials
 
-Usernames/passwords are loaded at backend startup from `VIEWER_USERNAME`, `VIEWER_PASSWORD`, `OPERATOR_USERNAME`, and `OPERATOR_PASSWORD`. The example file supplies local demonstration values; never treat those values as private credentials. `JWT_SECRET` must also be changed outside a trusted local environment. Grafana uses `GRAFANA_USER` (default `admin`) and `GRAFANA_PASSWORD` from `.env`. The real `.env` should be excluded from commits and submission archives.
+The following **local test credentials** are defined in the committed `.env.example` file. After copying it to `.env`, use these accounts to exercise both access levels:
 
-- **Viewer:** authorized read surfaces only; privileged controls are hidden/disabled and rejected by the Go API.
-- **Operator:** authorized read surfaces and relay, speed, threshold/mode, and reset operations.
+| Interface | Username | Password | Access |
+|---|---|---|---|
+| HWM application | `viewer` | `viewer-dev-pass` | Read-only monitoring |
+| HWM application | `operator` | `operator-dev-pass` | Monitoring and authorized control |
+| Grafana | `admin` | `example-pass` | Dashboard administration |
 
-No Django user administration, role editing or token refresh is provided. Both roles are configured through environment variables; passwords use bcrypt hashes in memory and JWT signing uses an environment secret. The UI redirects to login after token expiration (one-hour token lifetime).
+The Go backend reads `VIEWER_USERNAME`, `VIEWER_PASSWORD`, `OPERATOR_USERNAME`, `OPERATOR_PASSWORD` and `JWT_SECRET` from the environment. Grafana uses `GRAFANA_USER` (default `admin`) and `GRAFANA_PASSWORD`. **These are demonstration credentials only:** change them before using the stack outside an isolated local environment. Never commit the real `.env` file.
 
-## 2. Architecture and responsibility boundaries
+- **Viewer:** can access authorized monitoring surfaces; control actions are hidden/disabled in React and rejected by the Go API.
+- **Operator:** can access monitoring and authorized relay, speed, threshold/mode and reset operations.
 
-```text
-React / TypeScript (Vite build -> Nginx :3000)
-      | REST polling (~2 s), JWT Authorization header
-      v
-Go backend :8080
-  ├─ Auth: viewer/operator JWT + per-route capability checks
-  ├─ REST API, /healthz, /metrics
-  ├─ Pollers: per-device lifecycle, retry/backoff, health, fresh snapshots
-  ├─ Control engine: hysteresis, AUTO/MANUAL, relay/PWM coordination
-  ├─ SQLite: measurements, events, device_states, config
-  ├─ Modbus TCP ---> temp-humidity-sim :5021
-  ├─ Modbus TCP ---> relay-sim         :5022
-  ├─ Modbus TCP ---> thermocouple-sim  :5023
-  ├─ Modbus TCP ---> speed-pwm-sim     :5024
-  └─ raw TCP -----> remote-reset-sim  :9001
+Authentication uses two environment-configured roles. Passwords are checked against bcrypt hashes in memory; the Go backend issues signed, one-hour JWTs and enforces capabilities on each protected API route. The UI returns to login when the token expires.
 
-Prometheus :9090 --scrapes--> Go /metrics
-Grafana :3001 ----queries---> Prometheus
-React --------------------GET read-only Prometheus query through Nginx
+## 2. System architecture
+
+The platform separates **user-facing HTTP APIs**, **industrial Modbus TCP communication**, and an independent **reset-management channel**. Each simulated field device exposes a Modbus socket for telemetry/control and a separate HTTP administration socket for local fault injection. The reset simulator uses those administration sockets; it does **not** reuse the backend's Modbus connections.
+
+### Component and network diagram
+
+```mermaid
+flowchart TB
+    USER["Browser<br/>Viewer / Operator"]
+
+    subgraph APP["Application services"]
+        FE["React SPA + Nginx<br/>host :3000 / container :80"]
+        API["Go Backend<br/>host :8080 / container :8080<br/>REST · JWT/RBAC · Pollers · Control"]
+        DB[("SQLite<br/>/data/backend.db")]
+    end
+
+    subgraph FIELD["Simulated field devices · Docker network"]
+        TEMP["Temperature / Humidity<br/>Modbus :5021 · HTTP admin :5121"]
+        RELAY["8-channel Relay<br/>Modbus :5022 · HTTP admin :5122"]
+        THERMO["4-channel Thermocouple<br/>Modbus :5023 · HTTP admin :5123"]
+        PWM["PWM / Fan Drive<br/>Modbus :5024 · HTTP admin :5124"]
+        RESET["Remote Reset Simulator<br/>Raw TCP :9001"]
+    end
+
+    subgraph MON["Observability"]
+        PROM["Prometheus<br/>host/container :9090"]
+        GRAF["Grafana<br/>host :3001 / container :3000"]
+    end
+
+    USER -->|"HTTP :3000"| FE
+    FE -->|"REST /api/* + JWT<br/>GET /healthz"| API
+    FE -->|"GET /prometheus/api/v1/query"| PROM
+    API -->|"SQL"| DB
+    API -->|"Modbus TCP :5021"| TEMP
+    API -->|"Modbus TCP :5022"| RELAY
+    API -->|"Modbus TCP :5023"| THERMO
+    API -->|"Modbus TCP :5024"| PWM
+    API -->|"RESET target · raw TCP :9001"| RESET
+    RESET -.->|"POST /fault · :5121"| TEMP
+    RESET -.->|"POST /fault · :5122"| RELAY
+    RESET -.->|"POST /fault · :5123"| THERMO
+    RESET -.->|"POST /fault · :5124"| PWM
+    PROM -->|"GET /metrics · :8080"| API
+    GRAF -->|"PromQL /api/v1/query"| PROM
 ```
 
-Five simulators run in independent processes; the four Modbus devices use network sockets and the reset controller uses raw TCP. Device polling, business rules, storage and device-facing APIs remain in Go. **There is no SSE/WebSocket implementation:** the frontend uses bounded REST polling, which the assessment permits.
+**Network boundaries:** Modbus ports `5021`–`5024` are available only on the Compose network. HTTP simulator administration ports `5121`–`5124` and reset TCP `9001` are also published on the host's `127.0.0.1` interface for local tests. Browser requests go through Nginx; the Go backend talks directly to devices over Docker-internal sockets.
 
-| Directory | Purpose |
-|---|---|
-| `backend/cmd/backend/` | Startup, dependencies, pollers, HTTP lifecycle |
-| `backend/internal/poller/` | Per-device polling, fault transitions, reset generations |
-| `backend/internal/control/` | Fan hysteresis, AUTO/MANUAL ownership and synchronization |
-| `backend/internal/relay/`, `speed/`, `reset/` | Device protocol clients and feedback handling |
-| `backend/internal/auth/`, `api/` | JWT/capabilities, REST endpoints, Prometheus metrics |
-| `backend/internal/store/` | SQLite schema and persistence |
-| `simulators/cmd/`, `simulators/internal/` | Independent Modbus and reset simulator processes |
-| `frontend/src/` | React UI and HTTP polling |
-| `observability/` | Prometheus scrape config and provisioned Grafana dashboard |
-| `scripts/` | Core/Extended smoke, fault/recovery and race helpers |
+### Ports and interfaces
 
-## Architecture
+| Service | Host access | Docker-internal address | Protocol / purpose |
+|---|---|---|---|
+| Frontend (Nginx + React) | `http://localhost:3000` | `frontend:80` | HTTP SPA, `/api/*` reverse proxy |
+| Go backend | `http://localhost:8080` | `backend:8080` | HTTP REST, `/healthz`, `/metrics` |
+| Temperature/Humidity | Not published | `temp-humidity-sim:5021` | Modbus TCP, FC4 sensor values |
+| Relay | Not published | `relay-sim:5022` | Modbus TCP, FC1/FC5/FC15 coils |
+| Thermocouple | Not published | `thermocouple-sim:5023` | Modbus TCP, FC4 channels |
+| PWM / Fan drive | Not published | `speed-pwm-sim:5024` | Modbus TCP, FC3/FC6/FC16 |
+| Sensor admin | `127.0.0.1:5121` | `temp-humidity-sim:5121` | HTTP, `/state`, `/fault`, `/temp` |
+| Relay admin | `127.0.0.1:5122` | `relay-sim:5122` | HTTP, `/state`, `/fault` |
+| Thermocouple admin | `127.0.0.1:5123` | `thermocouple-sim:5123` | HTTP, `/state`, `/fault`, `/channel-fault`, `/channel-unpin` |
+| PWM admin | `127.0.0.1:5124` | `speed-pwm-sim:5124` | HTTP, `/state`, `/fault`, `/feedback` |
+| Remote reset | `127.0.0.1:9001` | `remote-reset-sim:9001` | Raw TCP, `PING`, `STATUS`, `RESET` |
+| Prometheus | `http://localhost:9090` | `prometheus:9090` | HTTP metrics collection / PromQL |
+| Grafana | `http://localhost:3001` | `grafana:3000` | HTTP dashboards |
 
-### System overview
+Host ports are configurable via `FRONTEND_PORT` (default `3000`), `BACKEND_PORT` (`8080`), `PROMETHEUS_PORT` (`9090`) and `GRAFANA_PORT` (`3001`). The admin and reset ports are fixed loopback bindings in the supplied Compose file.
 
-```text
-                        ┌──────────────────────────────┐
-   Browser  ───────────▶│  frontend (Nginx)   :3000    │
-                        │  React + TypeScript (Vite)   │
-                        └───────┬───────────┬──────────┘
-                    /api/, /healthz         │ /prometheus/api/v1/query (GET)
-                                │           │
-                                ▼           ▼
- ┌──────────────────────────────────┐   ┌────────────────────┐
- │ backend (Go)            :8080    │   │ Prometheus  :9090  │
- │  ├─ Auth (JWT, RBAC)             │   │ scrape: 2 s        │
- │  ├─ REST API  /api/*             │◀──│ backend:8080/metrics│
- │  ├─ /healthz   /metrics          │   └─────────┬──────────┘
- │  ├─ Pollers (1 goroutine/device) │             │ PromQL
- │  ├─ Control engine (hysteresis)  │             ▼
- │  └─ SQLite  /data/backend.db     │   ┌────────────────────┐
- └──┬─────────┬─────────┬─────────┬─┘   │ Grafana     :3001  │
-    │         │         │         │     │ hwm-industrial-    │
-    │ Modbus TCP        │         │     │ overview           │
-    ▼         ▼         ▼         ▼     └────────────────────┘
- ┌───────┐ ┌───────┐ ┌────────┐ ┌───────┐
- │temp-  │ │relay- │ │thermo- │ │speed- │      raw TCP
- │humid. │ │sim    │ │couple  │ │pwm-sim│  ┌──────────────────┐
- │ :5021 │ │ :5022 │ │ :5023  │ │ :5024 │  │ remote-reset-sim │◀── backend
- └───────┘ └───────┘ └────────┘ └───────┘  │      :9001       │
-                                           └──────────────────┘
+### Request and control paths
+
+| Operation | Request path | Backend / device interaction |
+|---|---|---|
+| Login | `POST /api/auth/login` | Go validates credentials and issues a JWT |
+| Live measurements | `GET /api/measurements?source=sensor` | Backend reads the latest stored/validated Modbus samples |
+| Relay control | `POST /api/relays/{id}` | Go writes the coil over Modbus and confirms read-back |
+| Fan speed | `GET/POST /api/fan/speed` | Go reads/writes PWM registers and checks RPM feedback |
+| Fan configuration | `GET/PUT /api/config/control` | Go updates hysteresis, AUTO/MANUAL and selected relay |
+| Thermocouple | `GET /api/thermocouple` | Four independent channels with per-channel fault state |
+| Device reset | `POST /api/reset` | Go → raw TCP `RESET <target>` → reset simulator → HTTP admin `/fault` |
+| Live metrics | `GET /metrics` | Prometheus scrapes the Go backend every 2 seconds |
+| Dashboard query | `GET /prometheus/api/v1/query` | Nginx forwards read-only PromQL queries to Prometheus |
+
+### Remote reset sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as React UI
+    participant API as Go Backend
+    participant RS as Reset Simulator
+    participant DEV as Device Simulator
+
+    UI->>API: POST /api/reset (JWT + target)
+    API->>RS: RESET target (TCP port 9001)
+    RS->>DEV: POST /fault?mode=down (HTTP admin)
+    DEV-->>RS: HTTP 200
+    RS-->>API: OK RESET target initiated
+    API-->>UI: HTTP 202 Accepted
+
+    Note over API,DEV: Backend invalidates telemetry and detects the Modbus outage
+    Note over RS,DEV: Simulated downtime is 5 seconds by default
+
+    RS->>DEV: POST /fault?mode=none (HTTP admin)
+    DEV-->>RS: HTTP 200
+
+    API->>DEV: New Modbus TCP poll
+    DEV-->>API: Valid fresh register values
+
+    Note over API,DEV: Recovery confirmed by fresh Modbus measurements
 ```
 
-### Ports
-
-| Service | Container port | Host address | Protocol | Purpose |
-|---|---|---|---|---|
-| frontend | 80 | `localhost:3000` | HTTP | React UI, reverse proxy to backend and Prometheus |
-| backend | 8080 | `localhost:8080` | HTTP | REST API, health, metrics |
-| prometheus | 9090 | `localhost:9090` | HTTP | Metrics storage and query |
-| grafana | 3000 | `localhost:3001` | HTTP | Dashboards |
-| temp-humidity-sim | 5021 | internal | Modbus TCP | Temperature / humidity |
-| relay-sim | 5022 | internal | Modbus TCP | 8-channel relay card |
-| thermocouple-sim | 5023 | internal | Modbus TCP | 4-channel thermocouple |
-| speed-pwm-sim | 5024 | internal | Modbus TCP | PWM command and tachometer |
-| remote-reset-sim | 9001 | `127.0.0.1:9001` | Raw TCP (line-based) | Power-cycle controller |
-| sensor admin | 5121 | `127.0.0.1:5121` | HTTP | Fault injection (local testing) |
-| relay admin | 5122 | `127.0.0.1:5122` | HTTP | Fault injection (local testing) |
-| thermocouple admin | 5123 | `127.0.0.1:5123` | HTTP | Fault injection (local testing) |
-| PWM admin | 5124 | `127.0.0.1:5124` | HTTP | Fault injection (local testing) |
-
-### Nginx routes (frontend :3000)
-
-| Path | Upstream |
-|---|---|
-| `/` | Static React build |
-| `/api/` | `backend:8080/api/` |
-| `/healthz` | `backend:8080/healthz` |
-| `/prometheus/api/v1/query` | `prometheus:9090/api/v1/query` (GET) |
-
-### Backend endpoints (:8080)
-
-| Method | Endpoint | Capability | Description |
-|---|---|---|---|
-| POST | `/api/auth/login` | public | Username/password → JWT |
-| GET | `/api/auth/me` | valid JWT | User, role, permissions |
-| GET | `/api/devices` | `read:device_status` | Device connectivity and state |
-| GET | `/api/measurements?source=` | by source | `sensor`, `thermocouple_ch0..3`, `fan_speed` |
-| GET | `/api/relays` | `read:relay` | Coil read-back, channels 0–7 |
-| POST | `/api/relays/{id}` | `write:relay` | `{"on":true}` |
-| GET | `/api/config/control` | `read:events` | Thresholds, mode, controller snapshot |
-| PUT | `/api/config/control` | `write:thresholds` | Update thresholds / AUTO-MANUAL |
-| GET | `/api/events?limit=` | `read:events` | Audit and status events |
-| GET | `/api/thermocouple` | `read:thermocouple` | 4 channels: live / fault / unknown |
-| GET | `/api/fan/speed` | `read:fan_speed` | PWM %, RPM, mismatch |
-| POST | `/api/fan/speed` | `write:fan_speed` | `{"percent":50}` |
-| POST | `/api/reset` | `write:reset` | `{"target":"relay"}` → 202 |
-| GET | `/healthz` | public | Process health |
-| GET | `/metrics` | public | Prometheus exposition |
-
-### Device protocols
-
-| Device | Address | Function codes | Registers / coils |
-|---|---|---|---|
-| Temperature / humidity | `temp-humidity-sim:5021` | FC4 | IR 0 = temperature ×10 °C, IR 1 = humidity ×10 %RH |
-| Relay card | `relay-sim:5022` | FC1 read, FC5/FC15 write | Coils 0–7 |
-| Thermocouple | `thermocouple-sim:5023` | FC4 | IR 0–3, signed int16 tenths °C, `0x8000` = channel fault |
-| PWM / fan drive | `speed-pwm-sim:5024` | FC3 read, FC6/FC16 write | HR 0 = command 0–100 %, HR 1 = RPM 0–3000 |
-| Remote reset | `remote-reset-sim:9001` | raw TCP | `PING`, `STATUS`, `RESET <target>` |
-
-Reset targets: `temp-humidity`, `relay`, `thermocouple`, `speed-pwm`.
-
-### Data flow
-
-1. **Poll:** every 2 s each poller reads its device over Modbus TCP, with retry/backoff and per-device health state.
-2. **Store:** a successful poll writes its measurements to SQLite in one transaction.
-3. **Control:** the control engine evaluates the hysteresis (`on_above` 30 °C / `off_below` 27 °C), writes the fan coil and confirms it by read-back; in AUTO the PWM reference follows `clamp(round(20 + 8 × (T − 25)), 0, 100)`.
-4. **Expose:** the backend serves the REST API and `/metrics`.
-5. **Observe:** Prometheus scrapes `/metrics` every 2 s; Grafana renders the provisioned dashboard from it.
-6. **Display:** React polls the REST API (~2 s) with the JWT and reads the temperature series from Prometheus through Nginx.
-
-### Persistence
-
-| Table | Content |
-|---|---|
-| `measurements` | Timestamped `source`, `metric`, value |
-| `events` | Audit and status events (`kind`, `source`, `message`, `actor`) |
-| `device_states` | Last state, last successful read, error, consecutive failures |
-| `config` | Control configuration and last updater |
-
-Database file: `/data/backend.db` (Compose named volume).
+A successful reset TCP acknowledgment means the reset sequence was initiated; device recovery is determined independently from subsequent valid Modbus reads.
 
 ### Source layout
 
-| Directory | Purpose |
+| Directory | Responsibility |
 |---|---|
-| `backend/cmd/backend/` | Startup, dependencies, pollers, HTTP lifecycle |
-| `backend/internal/poller/` | Per-device polling, fault transitions, reset generations |
-| `backend/internal/control/` | Hysteresis, AUTO/MANUAL ownership |
-| `backend/internal/relay/`, `speed/`, `reset/` | Device protocol clients |
-| `backend/internal/auth/`, `api/` | JWT/capabilities, REST endpoints, metrics |
-| `backend/internal/store/` | SQLite schema and persistence |
-| `simulators/` | Modbus and reset simulator processes |
-| `frontend/src/` | React UI |
-| `observability/` | Prometheus config, Grafana dashboard |
-| `scripts/` | Smoke and integration scripts |
+| `backend/cmd/backend/` | Startup, dependencies, pollers and HTTP lifecycle |
+| `backend/internal/poller/` | Device polling, retries, health and reset generations |
+| `backend/internal/control/` | Hysteresis, AUTO/MANUAL and relay/PWM coordination |
+| `backend/internal/relay/`, `speed/`, `reset/` | Modbus and raw TCP protocol clients |
+| `backend/internal/auth/`, `api/` | JWT authorization, REST endpoints and metrics |
+| `backend/internal/store/` | SQLite persistence |
+| `simulators/cmd/`, `simulators/internal/` | Four Modbus devices and the remote-reset process |
+| `frontend/src/` | React dashboard and HTTP polling |
+| `observability/` | Prometheus configuration and Grafana dashboards |
+| `scripts/` | Smoke, fault recovery and hysteresis integration tests |
 
-## 3. Modbus and reset protocol contracts
+## 3. Implemented features
+
+| Requirement | Implementation |
+|---|---|
+| **§2.1 Sensor (Core)** | Independent Modbus TCP sensor; 18–35 °C / 30–80% RH bounded random walk; FC4; two-second polling; timestamped SQLite measurements; fault injection, retry/backoff and honest status |
+| **§2.2 Relays (Core)** | Eight coils with configurable labels, Modbus write followed by coil read-back, distinct error conditions and authenticated control |
+| **§2.4 Go backend (Core)** | Device-facing Go packages, goroutine pollers, state snapshots, mutexes, cancellation and error handling |
+| **§2.5 Hysteresis (Core)** | Configurable upper/lower thresholds, strict transition rules, sensor freshness, read-back reconciliation, runtime edits and audit events |
+| **§2.7 React UI (Core)** | JWT login, monitoring graphs, device status, relays, thresholds/mode, thermocouple/PWM/reset controls and capability-aware rendering |
+| **§2.8 Prometheus/Grafana (Core)** | Go metrics endpoint, two-second scrape configuration, automatically provisioned Grafana dashboard, Prometheus-origin temperature shown in React |
+| **§2.10 JWT/RBAC (Core)** | Viewer/operator roles, bcrypt passwords, signed expiring JWTs, 401/403 and capability-guarded actions |
+| **§2.3 Thermocouple (Extended)** | Four independently tagged channels, signed tenth-degree decoding, explicit `0x8000` faults, live/fault/unknown API and React display |
+| **§2.6 Variable-speed fan (Extended)** | Modbus PWM with command read-back and independent tachometer RPM, MANUAL/AUTO, reference speed curve and persistent mismatch reporting |
+| **§2.9 Remote reset (Extended)** | Independent TCP reset server, four allowed targets, verified JWT actor, audit, explicit React confirmation, invalidation and recovery verification |
+
+## 4. Modbus register maps and reset protocol
 
 The following register maps are project-specific; they are not vendor maps.
 
@@ -253,7 +229,7 @@ services:
 
 This wiring is **not part of the base `docker-compose.yml`**. The file contains a JSON **array of 1–8 strings**, for example `["Fan 1", "Heater", "Lighting", "Aux Power"]`; changing labels requires backend restart, not a source-code edit.
 
-## 4. Fan control behavior
+## 5. Fan control behavior
 
 Initial configuration: AUTO mode, `on_above=30` °C, `off_below=27` °C, fan on relay channel 0. These values may be changed at runtime and are persisted in SQLite.
 
@@ -266,7 +242,7 @@ Initial configuration: AUTO mode, `on_above=30` °C, `off_below=27` °C, fan on 
 
 Device writes, mode changes and reset invalidation share a controller operation mutex. Sensor/poller generations reject obsolete reset-cycle samples. Status is represented honestly as online, degraded, offline, recovering, recovery failed or unknown where appropriate.
 
-## 5. REST API and authorization
+## 6. REST API and authorization
 
 With the exception of login, health and Prometheus exposition, routes require a valid JWT. The backend verifies capabilities independently of which controls React displays.
 
@@ -290,9 +266,9 @@ With the exception of login, health and Prometheus exposition, routes require a 
 
 Missing/invalid/expired credentials return `401`; authenticated callers lacking a required capability receive `403`. Unknown measurement sources return `400`. Other errors may include `400`, `404`, `409`, `502`, `503`, or `504` depending on the operation and device availability.
 
-Capabilities: `read:sensor`, `read:relay`, `read:thermocouple`, `read:fan_speed`, `read:events`, `read:device_status`, `write:relay`, `write:fan_speed`, `write:thresholds`, `write:reset`. These are **fixed in the baseline auth implementation**; there is no admin-managed capability grant/revoke service.
+Capabilities enforced by the Go API: `read:sensor`, `read:relay`, `read:thermocouple`, `read:fan_speed`, `read:events`, `read:device_status`, `write:relay`, `write:fan_speed`, `write:thresholds`, and `write:reset`.
 
-## 6. Persistence
+## 7. Persistence
 
 SQLite uses one logical database (`DB_PATH`, Compose volume `/data/backend.db`) and separate tables:
 
@@ -303,7 +279,7 @@ SQLite uses one logical database (`DB_PATH`, Compose volume `/data/backend.db`) 
 
 The measurement batch from a successful poll is transactional. Configuration writes and their event records are **separate SQL operations**; full atomic audit durability is not claimed. There is no automatic long-term retention/downsampling job.
 
-## 7. Observability: Prometheus and Grafana
+## 8. Observability: Prometheus and Grafana
 
 Prometheus scrapes `http://backend:8080/metrics` every two seconds. Grafana automatically provisions its Prometheus datasource and the dashboard at:
 
@@ -339,9 +315,7 @@ Selected metric families:
 
 Unknown/unavailable measurements are **not** intentionally exported as fresh zeroes. Live samples are limited by six-second freshness checks; missing values appear as gaps, not fabricated data. Metric counters reset when the Go process restarts. The React application also shows a metric sourced through Nginx's read-only `/prometheus/api/v1/query` proxy, not a duplicated REST sensor endpoint.
 
-**Historical-series note:** Earlier versions of `hwm_device_online` used a changing `state` label, which caused duplicate relay series. The current metric uses only `device`; old Prometheus history may still exist until it ages out of the selected range/retention period. No destructive volume reset is required.
-
-## 8. Simulator fault injection (local testing only)
+## 9. Simulator fault injection (local testing only)
 
 Admin HTTP endpoints are not protected by JWT and are intended for localhost testing only. Examples:
 
@@ -364,21 +338,46 @@ curl -X POST 'http://127.0.0.1:5124/feedback?rpm=auto'
 
 `malformed` mode uses a separate TCP responder that returns a deliberately truncated Modbus read frame. Fault injection can change physical-state simulations and automatic controller behavior; run it on an isolated development stack and restore state afterward.
 
-## 9. Verification
+## 10. Testing and verification
 
-### Test commands
+The application starts using Docker Compose alone, as shown in [Quick start](#1-quick-start). Go and Node.js are only needed on the host when running their respective tests outside containers; Python is only needed for the optional integration scripts.
 
-Run each Go module **from its own directory**:
+### Go unit tests, vet and race detector
+
+With a local Go 1.26 toolchain:
 
 ```bash
 (cd backend && go test -count=1 ./... && go vet ./... && go test -race ./...)
 (cd simulators && go test -count=1 ./... && go vet ./... && go test -race ./...)
-(cd frontend && npm ci && npm test && npm run build)
 ```
 
-Race testing requires a supported operating system/architecture and C compiler. Both Go modules declare **Go 1.26.0**; their Dockerfiles use `golang:1.26-alpine`.
+Or run race tests without installing Go on the host (from repository root, PowerShell):
 
-With the full Compose stack already running, execute **from repository root**:
+```powershell
+docker run --rm -v "${PWD}:/src" -w /src/backend golang:1.26 go test -race ./...
+docker run --rm -v "${PWD}:/src" -w /src/simulators golang:1.26 go test -race ./...
+```
+
+### Frontend tests and production build
+
+With Node.js available locally:
+
+```bash
+cd frontend
+npm ci
+npm test
+npm run build
+```
+
+Or run tests in a temporary Node container without creating `frontend/node_modules` on the host (PowerShell, from repository root):
+
+```powershell
+docker run --rm -v "${PWD}/frontend:/app" -v /app/node_modules -v /app/dist -w /app node:20-alpine sh -c "npm ci && npm test && npm run build"
+```
+
+### End-to-end integration tests
+
+With the Compose stack running, execute these Python scripts sequentially from repository root:
 
 ```bash
 python scripts/smoke_test.py
@@ -387,11 +386,21 @@ python scripts/fault_recovery_integration.py --max-wait 150
 python scripts/extended_smoke_test.py
 ```
 
-These scripts exercise live simulator state and should be run sequentially in a disposable local test environment. Additional manual browser checks should cover login/token expiry, permissions, reset confirmation, faults and live dashboard values.
+The integration suite covers JWT and role permissions, Modbus relay read-back, temperature hysteresis, independent thermocouple channels, AUTO/MANUAL PWM behavior, mismatch detection, fault injection, remote reset and fresh-data recovery. Go race tests for both modules have also been exercised successfully. For final UI verification, check the combined fan control card, Grafana dashboards and live reset state in the browser.
 
+## 11. Design decisions and known limitations
 
-## 10. Submission hygiene
+The implementation prioritizes the complete device-facing Go platform, real Modbus TCP communication, reliable control/read-back, observability and a reproducible Docker deployment. The following scope decisions and operational boundaries are intentional:
 
-Keep source code, Dockerfiles/Compose, `.env.example`, Grafana provisioning/dashboard, tests, `README.md`, and [`AI_USAGE.md`](AI_USAGE.md). **Do not package `.env`, `.git`, private tokens, local databases, compiled binaries, `node_modules` or generated frontend assets.** Commit intended source changes before producing a clean-checkout submission archive. The audit does not modify application source code.
+- **Identity and authorization:** The platform implements the Core viewer/operator JWT model in Go. The admin-managed Django identity service (§2.11), dynamic capability grants, RS256 token issuance and refresh flow were left out because §2.11 is an Extended requirement. The Go API still enforces route-specific read/write capabilities for its two configured roles.
+- **Real-time delivery:** React uses approximately two-second REST polling instead of WebSocket/SSE. Polling keeps the implementation straightforward while meeting the assessment's accepted real-time delivery option.
+- **Database and audit:** SQLite avoids an additional database service and supports transactional measurement batches. Configuration changes and their audit events use separate database operations, so those two writes are not guaranteed to commit atomically. No automated historical retention/downsampling job is configured.
+- **Deployment and authentication:** Docker Compose is configured for local evaluation rather than public production exposure. Demo credentials, published HTTP endpoints and simulator fault-injection interfaces require additional hardening before deployment to an untrusted network. JWTs expire after one hour; users log in again rather than refreshing a token.
+- **Safety boundary:** Software hysteresis, Modbus read-back and freshness checks are monitoring/control mechanisms, not substitutes for independent hardware safety interlocks.
+- **Additional bonus features:** Alert delivery, Modbus RTU, OpenTelemetry tracing and named capability presets were not pursued; effort was focused on the tested Modbus TCP devices, fault recovery, fan control and remote reset workflows.
+
+## 12. Submission hygiene
+
+Keep source code, Dockerfiles/Compose, `.env.example`, Grafana provisioning/dashboard, tests, `README.md`, and [`AI_USAGE.md`](AI_USAGE.md). **Do not package `.env`, `.git`, private tokens, local databases, compiled binaries, `node_modules` or generated frontend assets.** Commit intended source changes before producing a clean-checkout submission archive.
 
 For AI assistance disclosures see [`AI_USAGE.md`](AI_USAGE.md).
