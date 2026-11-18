@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertTriangle, CheckCircle2, Cpu, ExternalLink, Lock, LogOut, Power, RefreshCw, Shield, Sliders } from 'lucide-react';
 import { api, ApiError } from './api';
-import { createPolling } from './polling';
+import { createPolling, createSnapshotGuard } from './polling';
 import { LiveChart } from './LiveChart';
 import { ExtendedPanels } from './ExtendedPanels';
 import { ThermocoupleSnapshot, SpeedState, AuditEvent, ControlSnapshot, DeviceStatus, MeasurementPoint, RelayChannel, UserMe } from './types';
@@ -17,6 +17,7 @@ export function App() {
   const [thermocouple, setThermocouple] = useState<ThermocoupleSnapshot|null>(null);
   const [speed, setSpeed] = useState<SpeedState|null>(null);
   const speedRevision = useRef(0);
+  const relaySnapshots = useRef(createSnapshotGuard());
   const controlRevision = useRef(0);
   const resetEpoch = useRef<Record<string,number>>({});
   const [resetting, setResetting] = useState<Record<string,boolean>>({});
@@ -106,6 +107,7 @@ export function App() {
         const tasks: Promise<void>[] = [];
         const speedVersion = speedRevision.current;
         const controlVersion = controlRevision.current;
+        const relayVersion = relaySnapshots.current.capture();
 
         if (hasPerm('read:thermocouple')) tasks.push(api.thermocouple(token,signal).then(value=>{if(!signal.aborted){setThermocouple(value);setThermoAt(Date.now());}}).catch(err=>{if(!signal.aborted)setThermocouple(null);if(err instanceof ApiError && err.status===401)throw err;}));
         if (hasPerm('read:fan_speed')) tasks.push(api.speed(token,signal).then(value=>{if(!signal.aborted && speedVersion === speedRevision.current){setSpeed(value);setSpeedAt(Date.now());}}).catch(err=>{if(!signal.aborted && speedVersion === speedRevision.current)setSpeed(null);if(err instanceof ApiError && err.status===401)throw err;}));
@@ -145,13 +147,13 @@ export function App() {
         if (hasPerm('read:relay')) {
           tasks.push(
             api.relays(token, signal).then((channels) => {
-              if (signal.aborted) return;
+              if (signal.aborted || !relaySnapshots.current.accepts(relayVersion)) return;
               setRelays(channels); setRelayError(null);
             }).catch((error) => {
-              if (signal.aborted) return;
+              if (error instanceof ApiError && error.status === 401) throw error;
+              if (signal.aborted || !relaySnapshots.current.accepts(relayVersion)) return;
               setRelays([]); // never portray a stale coil state as an actual read-back
               setRelayError(error instanceof ApiError ? error.code : 'relay_unreachable');
-              if (error instanceof ApiError && error.status === 401) throw error;
             })
           );
         }
@@ -244,25 +246,29 @@ export function App() {
   };
 
   const toggleRelay = async (ch: RelayChannel) => {
-    if (!token || !hasPerm('write:relay') || !relayDeviceOnline || backendOffline) return;
+    if (!token || !hasPerm('write:relay') || !relayDeviceOnline || backendOffline || relaySnapshots.current.busy) return;
     if (control?.config.enabled && ch.id === control.config.fan_channel) {
       setActionMsg({ type: 'err', text: 'Fan is in AUTO mode. Select MANUAL and save the control mode before toggling Fan 1.' });
       return;
     }
+    const operation = relaySnapshots.current.begin();
     setBusyRelay(ch.id);
     setActionMsg(null);
     try {
       const updated = await api.setRelay(token, ch.id, !ch.on);
+      if (!operation.current()) return;
       setRelays((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
       setActionMsg({ type: 'ok', text: `Confirmed ${updated.label} -> ${updated.on ? 'ON' : 'OFF'} (read-back verified)` });
-      pollAll();
     } catch (err) {
+      if (!operation.current()) return;
       const msg = err instanceof ApiError ? err.code : 'relay_write_failed';
       setActionMsg({ type: 'err', text: `Relay ${ch.label} failed: ${msg}` });
       setRelays([]);
       setRelayError(msg);
     } finally {
+      operation.finish();
       setBusyRelay(null);
+      pollAll();
     }
   };
 
@@ -725,6 +731,7 @@ export function App() {
           }}
           onReset={async target => {
             resetEpoch.current[target] = Infinity;
+            const relayReset = target === 'relay' ? relaySnapshots.current.begin() : undefined;
             setResetting(previous => ({ ...previous, [target]: true }));
             if (target === 'temp-humidity') { setTemps([]); setHumids([]); setSensorFetchFailed(true); }
             if (target === 'relay') setRelays([]);
@@ -734,6 +741,7 @@ export function App() {
               await api.reset(token, target);
             } finally {
               resetEpoch.current[target] = Date.now();
+              relayReset?.finish();
               pollAll();
             }
           }}

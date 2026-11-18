@@ -9,7 +9,7 @@ async function load(file) {
   });
   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
 }
-const { createPolling } = await load('../src/polling.ts');
+const { createPolling, createSnapshotGuard } = await load('../src/polling.ts');
 const { api, ApiError } = await load('../src/api.ts');
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -103,4 +103,38 @@ test('polling endpoints forward cancellation to fetch', async () => {
   controller.abort();
   assert.equal(signals.length, 5);
   assert.ok(signals.every(signal => signal.aborted));
+});
+
+test('pre-command and during-command snapshots cannot replace relay read-back or failure', async () => {
+  for (const confirmed of [true, null]) {
+    const guard = createSnapshotGuard();
+    const old = deferred();
+    let displayed = false;
+    const before = guard.capture();
+    const reply = old.promise.then(value => { if (guard.accepts(before)) displayed = value; });
+    const write = guard.begin();
+    const during = guard.capture();
+    assert.ok(write.current());
+    displayed = confirmed;
+    write.finish();
+    old.resolve(false);
+    await reply;
+    assert.equal(displayed, confirmed);
+    assert.equal(guard.accepts(during), false);
+    assert.equal(guard.accepts(guard.capture()), true);
+  }
+});
+
+test('a relay reset supersedes an in-flight write and its snapshots', () => {
+  const guard = createSnapshotGuard();
+  const old = guard.capture();
+  const write = guard.begin();
+  const reset = guard.begin();
+  assert.equal(write.current(), false);
+  assert.equal(reset.current(), true);
+  reset.finish();
+  assert.equal(guard.busy, true);
+  write.finish();
+  assert.equal(guard.accepts(old), false);
+  assert.equal(guard.accepts(guard.capture()), true);
 });

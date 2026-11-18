@@ -22,3 +22,23 @@ export function createPolling(task: (signal: AbortSignal) => Promise<void>, inte
     },
   };
 }
+
+// A command invalidates earlier polls. Polls that start during a command
+// cannot know whether their snapshot preceded the physical change.
+export function createSnapshotGuard() {
+  let revision = 0;
+  let pending = 0;
+  return {
+    get busy() { return pending !== 0; },
+    capture() { return pending === 0 ? revision : undefined; },
+    accepts(snapshot: number | undefined) { return pending === 0 && snapshot === revision; },
+    begin() {
+      const operation = ++revision;
+      pending++;
+      return {
+        current: () => operation === revision,
+        finish: () => { pending--; },
+      };
+    },
+  };
+}
