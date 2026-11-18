@@ -54,7 +54,7 @@ def wait_until(label, probe, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=['timeout', 'garbage', 'both'], default='both')
+    parser.add_argument('--mode', choices=['timeout', 'garbage', 'malformed', 'down', 'both', 'all'], default='all')
     parser.add_argument('--max-wait', type=int, default=100,
                         help='Seconds allowed for each offline/recovery transition')
     args = parser.parse_args()
@@ -81,7 +81,9 @@ def main():
     def metric_offline():
         with urlopen(BASE + '/metrics', timeout=8) as response:
             body = response.read().decode('utf-8')
-        return 'hwm_device_online{device="sensor",state="offline"} 0' in body
+        return ('hwm_device_online{device="sensor",state="offline"} 0' in body
+                and 'hwm_sensor_temperature_celsius' not in body
+                and 'hwm_sensor_humidity_percent' not in body)
 
     # Reject an already faulted simulator so tests never discard someone else's test state.
     original = request(SENSOR + '/state')
@@ -92,7 +94,8 @@ def main():
         raise RuntimeError('Sensor is not online before test; cannot establish baseline')
     print('[OK] baseline: sensor online')
 
-    modes = ['timeout', 'garbage'] if args.mode == 'both' else [args.mode]
+    modes = {'both': ['timeout', 'garbage'],
+             'all': ['timeout', 'garbage', 'malformed', 'down']}.get(args.mode, [args.mode])
     try:
         for mode in modes:
             print(f'\n--- Injecting {mode} ---')
@@ -109,14 +112,15 @@ def main():
             still = sensor_status()
             assert still['state'] == 'offline', (mode, still)
             assert still['last_seen'] == last_seen, f'{mode}: invalid data advanced last_seen'
+            if mode == 'malformed':
+                assert still['last_error'] == 'read input registers: protocol error', still
             print(f'[OK] {mode}: no false successful sample / last_seen unchanged')
             fault('none')
             wait_until(f'{mode}: sensor recovered online',
                        lambda: sensor_status()['state'] == 'online', args.max_wait)
             assert backend_alive(), 'Go backend health endpoint failed after recovery'
             print(f'[OK] {mode}: recovery completed')
-        print('\nPASS: timeout + garbage fault/recovery checks' if args.mode == 'both'
-              else f'PASS: {args.mode} fault/recovery checks')
+        print('\nPASS: ' + ' + '.join(modes) + ' fault/recovery checks')
     finally:
         # Make restoration resilient if the backend is temporarily unreachable.
         try:

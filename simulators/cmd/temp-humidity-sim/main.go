@@ -19,23 +19,40 @@ import (
 	temphumidity "sim/internal/temphumidity"
 )
 
-var _ = strconv.Atoi // keep import if unused in some binaries
-
 type supervisor struct {
-	mu  sync.Mutex
-	url string
-	h   modbus.RequestHandler
-	srv *modbus.ModbusServer
+	mu        sync.Mutex
+	addr      string
+	store     *temphumidity.Store
+	h         modbus.RequestHandler
+	srv       *modbus.ModbusServer
+	malformed func()
 }
 
-func (s *supervisor) up() error {
+func (s *supervisor) setFault(mode fault.Mode, delay time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.store.SetFault(mode, delay)
+	switch mode {
+	case fault.Down:
+		s.stopLocked()
+		return nil
+	case fault.Malformed:
+		if s.malformed == nil {
+			s.stopLocked()
+			stop, err := temphumidity.StartMalformedListener(s.addr)
+			if err != nil {
+				return err
+			}
+			s.malformed = stop
+		}
+		return nil
+	}
 	if s.srv != nil {
 		return nil
 	}
+	s.stopLocked()
 	srv, err := modbus.NewServer(&modbus.ServerConfiguration{
-		URL:        s.url,
+		URL:        "tcp://" + s.addr,
 		Timeout:    60 * time.Second,
 		MaxClients: 10,
 	}, s.h)
@@ -52,9 +69,17 @@ func (s *supervisor) up() error {
 func (s *supervisor) down() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stopLocked()
+}
+
+func (s *supervisor) stopLocked() {
 	if s.srv != nil {
 		_ = s.srv.Stop()
 		s.srv = nil
+	}
+	if s.malformed != nil {
+		s.malformed()
+		s.malformed = nil
 	}
 }
 
@@ -72,15 +97,16 @@ func main() {
 
 	store := temphumidity.NewStore()
 	sup := &supervisor{
-		url: "tcp://" + env("MODBUS_ADDR", "0.0.0.0:5021"),
-		h:   temphumidity.NewHandler(store),
+		addr:  env("MODBUS_ADDR", "0.0.0.0:5021"),
+		store: store,
+		h:     temphumidity.NewHandler(store),
 	}
-	if err := sup.up(); err != nil {
+	if err := sup.setFault(fault.None, 0); err != nil {
 		log.Error("modbus listener failed", "err", err)
 		os.Exit(1)
 	}
 	defer sup.down()
-	log.Info("temp-humidity-sim listening", "url", sup.url)
+	log.Info("temp-humidity-sim listening", "addr", sup.addr)
 
 	// Periodic simulation step
 	go func() {
@@ -112,7 +138,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		mode, err := fault.ParseMode(r.URL.Query().Get("mode"))
+		mode, err := fault.ParseMode(r.URL.Query().Get("mode"), fault.Malformed)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -124,10 +150,7 @@ func main() {
 				return
 			}
 		}
-		store.SetFault(mode, delay)
-		if mode == fault.Down {
-			sup.down()
-		} else if err := sup.up(); err != nil {
+		if err := sup.setFault(mode, delay); err != nil {
 			http.Error(w, "restart failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
