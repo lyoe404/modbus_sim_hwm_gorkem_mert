@@ -21,7 +21,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	var b strings.Builder
 
 	// 1. Device connectivity status
-	b.WriteString("# HELP hwm_device_online Whether the field device is currently online (1=online, 0=degraded/offline)\n")
+	b.WriteString("# HELP hwm_device_online Whether the field device is currently online (1=online, 0=not online)\n")
 	b.WriteString("# TYPE hwm_device_online gauge\n")
 	statuses := s.Statuses()
 	for _, st := range statuses {
@@ -29,7 +29,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		if st.State == "online" {
 			online = 1
 		}
-		fmt.Fprintf(&b, "hwm_device_online{device=%s,state=%s} %d\n", metricLabel(st.Name), metricLabel(string(st.State)), online)
+		fmt.Fprintf(&b, "hwm_device_online{device=%s} %d\n", metricLabel(st.Name), online)
 	}
 	b.WriteString("# HELP hwm_device_consecutive_failures Consecutive polling failures per device\n")
 	b.WriteString("# TYPE hwm_device_consecutive_failures gauge\n")

@@ -81,7 +81,7 @@ def main():
     def metric_offline():
         with urlopen(BASE + '/metrics', timeout=8) as response:
             body = response.read().decode('utf-8')
-        return ('hwm_device_online{device="sensor",state="offline"} 0' in body
+        return ('hwm_device_online{device="sensor"} 0' in body
                 and 'hwm_sensor_temperature_celsius' not in body
                 and 'hwm_sensor_humidity_percent' not in body)
 

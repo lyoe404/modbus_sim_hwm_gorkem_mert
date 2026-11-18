@@ -28,8 +28,8 @@
       },
       "targets": [
         {
-          "expr": "hwm_device_online",
-          "legendFormat": "{{device}} ({{state}})"
+          "expr": "hwm_device_online{state=\"\"}",
+          "legendFormat": "{{device}}"
         }
       ],
       "fieldConfig": {

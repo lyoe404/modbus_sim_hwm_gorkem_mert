@@ -59,3 +59,44 @@ func TestMetricsPrometheusParsingAndFamilyGrouping(t *testing.T) {
 		t.Fatalf("device metric families are interleaved:\n%s", body)
 	}
 }
+
+func TestDeviceOnlineMetricKeepsRelaySeriesAcrossStateChanges(t *testing.T) {
+	var state poller.State
+	server := &Server{
+		Relays: &fakeRelays{},
+		Store:  &fakeStore{},
+		Statuses: func() []poller.DeviceStatus {
+			return []poller.DeviceStatus{{Name: "relay", State: state}}
+		},
+	}
+	for _, test := range []struct {
+		state poller.State
+		value float64
+	}{
+		{poller.StateOnline, 1},
+		{poller.StateDegraded, 0},
+		{poller.StateOffline, 0},
+		{poller.StateRecovering, 0},
+		{poller.StateOnline, 1},
+	} {
+		state = test.state
+		response := httptest.NewRecorder()
+		server.metrics(response, httptest.NewRequest("GET", "/metrics", nil))
+		parser := expfmt.NewTextParser(model.LegacyValidation)
+		families, err := parser.TextToMetricFamilies(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metrics := families["hwm_device_online"].GetMetric()
+		if len(metrics) != 1 {
+			t.Fatalf("%s: got %d series, want 1", state, len(metrics))
+		}
+		labels := metrics[0].GetLabel()
+		if len(labels) != 1 || labels[0].GetName() != "device" || labels[0].GetValue() != "relay" {
+			t.Fatalf("%s: unexpected series labels: %v", state, labels)
+		}
+		if got := metrics[0].GetGauge().GetValue(); got != test.value {
+			t.Fatalf("%s: got %v, want %v", state, got, test.value)
+		}
+	}
+}
