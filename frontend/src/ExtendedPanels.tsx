@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Check, Fan, Loader2, Lock, RotateCcw, Thermometer, X } from 'lucide-react';
 import { api, ApiError } from './api';
 import { ControlSnapshot, DeviceStatus, SpeedState, ThermocoupleSnapshot } from './types';
@@ -14,6 +14,7 @@ interface Props {
   thermoLive: boolean;
   speedLive: boolean;
   backendOffline: boolean;
+  fanConfig?: React.ReactNode;
   onControl: (snapshot: ControlSnapshot) => void;
   onSpeed: (state: SpeedState | null) => void;
   onReset: (target: string) => Promise<void>;
@@ -52,7 +53,7 @@ function Status({ state }: { state: string }) {
 
 export function ExtendedPanels(props: Props) {
   const { token, hasPerm, thermocouple, speed, control, devices, resetting, thermoLive, speedLive,
-    backendOffline, onControl, onSpeed, onReset } = props;
+    backendOffline, fanConfig, onControl, onSpeed, onReset } = props;
   const [draft, setDraft] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [speedBusy, setSpeedBusy] = useState(false);
@@ -140,7 +141,7 @@ export function ExtendedPanels(props: Props) {
 
       {hasPerm('read:fan_speed') && <article className="device-panel">
         <header className="device-panel-header">
-          <div className="device-heading"><span className="device-icon"><Fan size={20} /></span><div><h2>PWM fan speed</h2><p>Command output & measured feedback</p></div></div>
+          <div className="device-heading"><span className="device-icon"><Fan size={20} /></span><div><h2>Fan Control &amp; PWM</h2><p>Mode, hysteresis thresholds, command output &amp; RPM feedback</p></div></div>
           <Status state={currentSpeed ? 'live' : 'unavailable'} />
         </header>
         <div className="pwm-readings">
@@ -166,7 +167,9 @@ export function ExtendedPanels(props: Props) {
         </div>
         {currentSpeed?.mismatch && <p className="device-notice warning">RPM feedback differs from the command after the settling period. Check the fan or feedback signal.</p>}
         <Notice value={speedNotice} />
+        {fanConfig}
       </article>}
+      {!hasPerm('read:fan_speed') && fanConfig && <article className="device-panel">{fanConfig}</article>}
     </section>
 
     {hasPerm('write:reset') && <section className="device-panel">

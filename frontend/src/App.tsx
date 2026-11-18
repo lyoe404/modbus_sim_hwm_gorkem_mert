@@ -51,7 +51,6 @@ export function App() {
   const [onAboveInput, setOnAboveInput] = useState('30');
   const [offBelowInput, setOffBelowInput] = useState('27');
   const [fanChInput, setFanChInput] = useState('0');
-  const [enabledInput, setEnabledInput] = useState(true);
   const [savingCfg, setSavingCfg] = useState(false);
 
   const logout = useCallback((reason?: string) => {
@@ -204,7 +203,6 @@ export function App() {
               setOnAboveInput((prev) => (document.activeElement?.id === 'on_above' ? prev : String(snap.config.on_above)));
               setOffBelowInput((prev) => (document.activeElement?.id === 'off_below' ? prev : String(snap.config.off_below)));
               setFanChInput((prev) => (document.activeElement?.id === 'fan_ch' ? prev : String(snap.config.fan_channel)));
-              setEnabledInput((prev) => (document.activeElement?.id === 'auto_enabled' ? prev : snap.config.enabled));
             })
           );
         }
@@ -316,7 +314,6 @@ export function App() {
     setActionMsg(null);
     try {
       const snap = await api.putControl(token, {
-        enabled: enabledInput,
         on_above: parseFloat(onAboveInput),
         off_below: parseFloat(offBelowInput),
         fan_channel: parseInt(fanChInput, 10),
@@ -598,10 +595,10 @@ export function App() {
         )}
 
         {/* Controls & Threshold Config */}
-        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <section className="grid grid-cols-1 gap-6">
           {/* Relay Card */}
           {hasPerm('read:relay') && (
-            <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5">
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
                   <Power className="w-5 h-5 text-indigo-400" />
@@ -653,94 +650,7 @@ export function App() {
             </div>
           )}
 
-          {/* Hysteresis Config */}
-          {hasPerm('read:events') && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Sliders className="w-5 h-5 text-indigo-400" />
-                  <h2 className="font-semibold text-white">Auto Fan Control</h2>
-                </div>
-                {!canWriteThresholds && (
-                  <span className="flex items-center gap-1 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded-full">
-                    <Lock className="w-3 h-3" /> Read-Only
-                  </span>
-                )}
-              </div>
 
-              <p className="text-xs text-slate-400 mb-3">
-                AUTO: temperature controls the fan; the configured fan relay is locked.
-                MANUAL: authorized operators may toggle the fan relay directly.
-                Select a mode and click Save to apply it.
-              </p>
-              <form onSubmit={saveControlConfig} className="space-y-3">
-                <label className="flex items-center gap-2 text-sm text-slate-300">
-                  <input
-                    id="auto_enabled"
-                    type="checkbox"
-                    disabled={!canWriteThresholds}
-                    checked={enabledInput}
-                    onChange={(e) => setEnabledInput(e.target.checked)}
-                    className="rounded bg-slate-950 border-slate-700"
-                  />
-                  AUTO mode (unchecked = MANUAL mode)
-                </label>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">On Above (°C)</label>
-                    <input
-                      id="on_above"
-                      type="number"
-                      step="0.5"
-                      disabled={!canWriteThresholds}
-                      value={onAboveInput}
-                      onChange={(e) => setOnAboveInput(e.target.value)}
-                      className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Off Below (°C)</label>
-                    <input
-                      id="off_below"
-                      type="number"
-                      step="0.5"
-                      disabled={!canWriteThresholds}
-                      value={offBelowInput}
-                      onChange={(e) => setOffBelowInput(e.target.value)}
-                      className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">Target Fan Relay Channel (0–7)</label>
-                  <input
-                    id="fan_ch"
-                    type="number"
-                    min="0"
-                    max="7"
-                    disabled={!canWriteThresholds}
-                    value={fanChInput}
-                    onChange={(e) => setFanChInput(e.target.value)}
-                    className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={!canWriteThresholds || savingCfg}
-                  className="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-sm font-medium transition"
-                >
-                  {!canWriteThresholds
-                    ? 'Requires write:thresholds'
-                    : savingCfg
-                    ? 'Saving...'
-                    : 'Save Mode & Thresholds'}
-                </button>
-              </form>
-            </div>
-          )}
         </section>
 
         <ExtendedPanels
@@ -755,10 +665,76 @@ export function App() {
           thermoLive={!backendOffline && !resetting.thermocouple && clock - thermoAt <= 6000}
           speedLive={!backendOffline && !resetting['speed-pwm'] && clock - speedAt <= 6000}
           backendOffline={backendOffline}
+          fanConfig={hasPerm('read:events') ? (
+            <div className="border-t border-slate-800 pt-5 mt-5 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2"><Sliders className="w-4 h-4 text-indigo-400" /><h3 className="font-medium text-white">Auto Fan Control &amp; Hysteresis</h3></div>
+                {!canWriteThresholds && <span className="text-xs text-amber-300">Read-only</span>}
+              </div>
+<p className="text-xs text-slate-400 mb-3">
+  AUTO: temperature controls the fan; the configured fan relay is locked.
+  MANUAL: authorized operators may toggle the fan relay directly.
+  Use AUTO/MANUAL buttons above to change mode; Save Thresholds applies the hysteresis settings.
+</p>
+<form onSubmit={saveControlConfig} className="space-y-3">
+  <div className="grid grid-cols-2 gap-3">
+    <div>
+      <label className="block text-xs text-slate-400 mb-1">On Above (°C)</label>
+      <input
+        id="on_above"
+        type="number"
+        step="0.5"
+        disabled={!canWriteThresholds}
+        value={onAboveInput}
+        onChange={(e) => setOnAboveInput(e.target.value)}
+        className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
+      />
+    </div>
+    <div>
+      <label className="block text-xs text-slate-400 mb-1">Off Below (°C)</label>
+      <input
+        id="off_below"
+        type="number"
+        step="0.5"
+        disabled={!canWriteThresholds}
+        value={offBelowInput}
+        onChange={(e) => setOffBelowInput(e.target.value)}
+        className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
+      />
+    </div>
+  </div>
+
+  <div>
+    <label className="block text-xs text-slate-400 mb-1">Target Fan Relay Channel (0–7)</label>
+    <input
+      id="fan_ch"
+      type="number"
+      min="0"
+      max="7"
+      disabled={!canWriteThresholds}
+      value={fanChInput}
+      onChange={(e) => setFanChInput(e.target.value)}
+      className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-sm disabled:opacity-60"
+    />
+  </div>
+
+  <button
+    type="submit"
+    disabled={!canWriteThresholds || savingCfg}
+    className="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-sm font-medium transition"
+  >
+    {!canWriteThresholds
+      ? 'Requires write:thresholds'
+      : savingCfg
+      ? 'Saving...'
+      : 'Save Thresholds'}
+  </button>
+</form>
+            </div>
+          ) : null}
           onControl={snap => {
             controlRevision.current++;
             setControl(snap);
-            setEnabledInput(snap.config.enabled);
             pollAll();
           }}
           onSpeed={value => {

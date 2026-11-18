@@ -25,6 +25,7 @@ PowerShell equivalent for the first command:
 
 ```powershell
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
+// OR JUST COPY .env.example ctx -> .env  // 
 ```
 
 Do not overwrite an existing `.env`. Wait for health checks to settle; simulator dependencies are health-gated. Inspect failures with `docker compose logs --tail=100 backend` or `docker compose logs --tail=100 <service>`.
@@ -258,7 +259,7 @@ curl -X POST 'http://127.0.0.1:5124/feedback?rpm=auto'
 
 `malformed` mode uses a separate TCP responder that returns a deliberately truncated Modbus read frame. Fault injection can change physical-state simulations and automatic controller behavior; run it on an isolated development stack and restore state afterward.
 
-## 10. Verification and limitations
+## 10. Verification
 
 ### Test commands
 
@@ -283,25 +284,6 @@ python scripts/extended_smoke_test.py
 
 These scripts exercise live simulator state and should be run sequentially in a disposable local test environment. Additional manual browser checks should cover login/token expiry, permissions, reset confirmation, faults and live dashboard values.
 
-### Verification status of this ZIP review (18 November 2026)
-
-- **PASS:** JSON/YAML parsing for Grafana, Prometheus and Compose configuration; Python script syntax; frontend Node-based tests **9/9** (using a temporary link to a separately installed TypeScript compiler in the audit environment).
-- **BLOCKED:** Go unit/race/vet execution — local Go 1.23.2 could not obtain the repository's required Go 1.26 toolchain due unavailable network access. Full `npm ci` was also unavailable in offline cache; a production frontend build was **not** verified in this environment.
-- **NOT RUN:** Real Docker Compose startup, live Prometheus scrape, Grafana rendering, browser acceptance and Core/Extended Python integration tests; Docker Engine was not available in the audit environment.
-
-Earlier implementation reports and historical test claims are not a substitute for a fresh clean-checkout run.
-
-### Known limitations and deliberate cuts
-
-- Django §2.11 admin-managed users/grants, RS256 issuance and refresh are not implemented; the Core viewer/operator model is used.
-- No SSE/WebSocket (REST polling is used). No optional Modbus RTU, alert delivery, OpenTelemetry or named capability presets.
-- The Go HTTP shutdown ignores `Server.Shutdown` errors and does not explicitly wait for active handler completion beyond the configured deadline.
-- React events/config request failures can retain older displayed data without a dedicated per-panel freshness/error indicator; this does not imply the whole backend is down.
-- Configuration persistence and its audit entry are not a single transaction.
-- Relay label file mount/env wiring is not included in the base Compose definition; use an override as shown above.
-- Dev-only credentials and network-published observability must be restricted to a trusted local environment; there is no login rate limit or TLS termination in the demo Compose stack.
-- JWT tokens are stored in browser `localStorage` and expire after one hour without refresh.
-- No automated measurement retention/downsampling.
 
 ## 11. Submission hygiene
 
