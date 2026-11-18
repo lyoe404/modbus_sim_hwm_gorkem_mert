@@ -17,4 +17,4 @@ Disclosure required by brief §1.4.
 - I can explain and extend any part of the running code in the technical discussion (§8.3), including adding a relay channel, a second hysteresis zone, or a new capability end to end.
 
 
-Core review follow-up: OpenAI Codex reviewed the supplied v3.1 assessment and corrected measurement-source capability enforcement, overlapping React polling, and backend health reporting. Added source authorization, polling cleanup/recovery, and health regression tests. Django and Extended device implementations were left unchanged.
+Core review follow-up: OpenAI Codex reviewed the supplied v3.1 assessment and corrected measurement-source capability enforcement, overlapping React polling, and backend health reporting. Added source authorization, polling cleanup/recovery, and health regression tests. Overall 
