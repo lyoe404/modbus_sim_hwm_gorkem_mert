@@ -114,6 +114,11 @@ func newEnv(t *testing.T) *env {
 		Statuses: func() []poller.DeviceStatus {
 			return []poller.DeviceStatus{{Name: "sensor", State: poller.StateOnline}}
 		},
+		DeviceMetrics: func() []DeviceMetrics {
+			now := time.Now()
+			return []DeviceMetrics{{Status: poller.DeviceStatus{Name: "relay", State: poller.StateOnline, LastSeen: now},
+				Measurements: []poller.Measurement{{Metric: "coil", Source: "Fan", At: now}}}}
+		},
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler()
 	return e
