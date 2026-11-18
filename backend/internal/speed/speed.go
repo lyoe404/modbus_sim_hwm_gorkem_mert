@@ -17,10 +17,16 @@ type State struct {
 	Mismatch    bool   `json:"mismatch"`
 }
 type Controller struct {
-	URL         string
-	Timeout     time.Duration
-	mu          sync.Mutex
-	c           *modbus.ModbusClient
+	URL     string
+	Timeout time.Duration
+	mu      sync.Mutex
+	c       *modbus.ModbusClient
+	FeedbackTracker
+}
+
+// FeedbackTracker evaluates persistent divergence across sampled RPM readings.
+// Its caller serializes observations.
+type FeedbackTracker struct {
 	lastCommand uint16
 	commandAt   time.Time
 	mismatchAt  time.Time
@@ -53,22 +59,26 @@ func (s *Controller) read() (State, error) {
 		s.closeLocked()
 		return State{}, err
 	}
-	now := time.Now()
-	if s.commandAt.IsZero() || s.lastCommand != regs[0] {
-		s.lastCommand = regs[0]
+	mismatch := s.FeedbackTracker.Observe(regs[0], regs[1], time.Now())
+	if regs[0] > 100 || regs[1] > 3000 {
+		return State{}, errors.New("invalid PWM registers")
+	}
+	return State{CommandPct: regs[0], FeedbackRPM: regs[1], Mismatch: mismatch}, nil
+}
+
+func (s *FeedbackTracker) Observe(command, rpm uint16, now time.Time) bool {
+	if s.commandAt.IsZero() || s.lastCommand != command {
+		s.lastCommand = command
 		s.commandAt = now
 		s.mismatchAt = time.Time{}
 	}
-	divergent := abs(int(regs[1])-int(regs[0])*30) > 300
+	divergent := abs(int(rpm)-int(command)*30) > 300
 	if !divergent {
 		s.mismatchAt = time.Time{}
 	} else if s.mismatchAt.IsZero() {
 		s.mismatchAt = now
 	}
-	if regs[0] > 100 || regs[1] > 3000 {
-		return State{}, errors.New("invalid PWM registers")
-	}
-	return State{CommandPct: regs[0], FeedbackRPM: regs[1], Mismatch: divergent && now.Sub(s.commandAt) >= 5*time.Second && now.Sub(s.mismatchAt) >= 5*time.Second}, nil
+	return divergent && now.Sub(s.commandAt) >= 5*time.Second && now.Sub(s.mismatchAt) >= 5*time.Second
 }
 func abs(x int) int {
 	if x < 0 {

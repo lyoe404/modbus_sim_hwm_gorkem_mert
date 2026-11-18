@@ -63,7 +63,13 @@ type Event struct {
 }
 
 // Store is a SQLite-backed store. It implements poller.Sink.
-type Store struct{ db *sql.DB }
+type Store struct {
+	db           *sql.DB
+	observeEvent func(string)
+}
+
+// SetEventObserver configures observation of committed audit events before serving.
+func (s *Store) SetEventObserver(fn func(string)) { s.observeEvent = fn }
 
 // Open opens (creating if needed) the database at path and applies the schema.
 func Open(path string) (*Store, error) {
@@ -148,6 +154,9 @@ func (s *Store) AddEvent(ctx context.Context, e Event) error {
 	_, err := s.db.ExecContext(ctx,
 		"INSERT INTO events(ts, kind, source, message, actor) VALUES(?,?,?,?,?)",
 		e.At.UnixMilli(), e.Kind, e.Source, e.Message, e.Actor)
+	if err == nil && s.observeEvent != nil {
+		s.observeEvent(e.Kind)
+	}
 	return err
 }
 

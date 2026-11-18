@@ -23,10 +23,12 @@ type Poller struct {
 	log      *slog.Logger
 	onChange func(DeviceStatus)
 	onPoll   func(DeviceStatus)
+	observe  func(string, time.Duration, error)
 
 	cycleMu    sync.Mutex
 	mu         sync.RWMutex
 	status     DeviceStatus
+	latest     []Measurement
 	generation uint64
 	recovery   func(context.Context) (string, error)
 }
@@ -49,6 +51,16 @@ func New(cfg Config, r Reader, s Sink, log *slog.Logger, onChange func(DeviceSta
 // SetOnPoll registers a callback for *every* completed poll, including repeated
 // failures. Configure before Run; it must not be replaced while Run is active.
 func (p *Poller) SetOnPoll(fn func(DeviceStatus)) { p.onPoll = fn }
+
+// SetPollObserver instruments device reads. Configure before Run.
+func (p *Poller) SetPollObserver(fn func(string, time.Duration, error)) { p.observe = fn }
+
+// Snapshot returns health and the measurements committed in the same poll.
+func (p *Poller) Snapshot() (DeviceStatus, []Measurement) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.status, append([]Measurement(nil), p.latest...)
+}
 
 // Status returns a copy of the current status; safe for concurrent use.
 func (p *Poller) Status() DeviceStatus {
@@ -112,12 +124,16 @@ func (p *Poller) poll(ctx context.Context) int {
 	var measurements []Measurement
 	var commit func() []Measurement
 	var err error
+	start := time.Now()
 	if staged, ok := p.reader.(interface {
 		readStaged(context.Context) (func() []Measurement, error)
 	}); ok {
 		commit, err = staged.readStaged(ctx)
 	} else {
 		measurements, err = p.reader.Read(ctx)
+	}
+	if p.observe != nil {
+		p.observe(status.Name, time.Since(start), err)
 	}
 	p.cycleMu.Lock()
 	defer p.cycleMu.Unlock()
@@ -143,7 +159,7 @@ func (p *Poller) poll(ctx context.Context) int {
 	p.mu.Lock()
 	p.recovery = nil
 	p.mu.Unlock()
-	p.publish(DeviceStatus{Name: status.Name, State: StateOnline, LastSeen: time.Now()})
+	p.publish(DeviceStatus{Name: status.Name, State: StateOnline, LastSeen: time.Now()}, measurements...)
 	return 0
 }
 
@@ -160,10 +176,11 @@ func (p *Poller) invalidateReader() {
 }
 
 // publish runs under cycleMu so callbacks see transitions in commit order.
-func (p *Poller) publish(cur DeviceStatus) {
+func (p *Poller) publish(cur DeviceStatus, measurements ...Measurement) {
 	p.mu.Lock()
 	prev := p.status.State
 	p.status = cur
+	p.latest = measurements
 	p.mu.Unlock()
 
 	if cur.State != prev {

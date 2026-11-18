@@ -85,6 +85,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer db.Close()
+	operations := api.NewOperations()
+	db.SetEventObserver(operations.Event)
 
 	const pollInterval = 2 * time.Second
 	modbusURL := env("MODBUS_URL", "tcp://127.0.0.1:5020")
@@ -114,7 +116,7 @@ func run(log *slog.Logger) error {
 		Speed:           speedControl,
 		Switch:          relaySwitch(relays),
 		FanReader:       fanCoilReader{controller: relays},
-		Recorder:        eventRecorder(db),
+		Recorder:        eventRecorder(db, operations),
 		Store:           db,
 		Log:             log,
 		Channels:        len(labels),
@@ -131,6 +133,7 @@ func run(log *slog.Logger) error {
 	type resetAudit struct {
 		target, actor  string
 		reportedFailed bool
+		acknowledged   bool
 	}
 	resetAudits := make(map[string]resetAudit)
 	// Persist each observed device health snapshot, including repeated failures and
@@ -155,6 +158,13 @@ func run(log *slog.Logger) error {
 			}
 			resetAuditMu.Unlock()
 			if message != "" {
+				result := "verified"
+				if st.State == poller.StateRecoveryFailed {
+					result = "failed"
+				}
+				if entry.acknowledged {
+					operations.Recovery(entry.target, result)
+				}
 				if err := db.AddEvent(dbCtx, store.Event{Kind: "device_reset", Source: entry.target, Actor: entry.actor, Message: message}); err != nil {
 					log.Error("reset recovery audit", "err", err)
 				}
@@ -194,8 +204,10 @@ func run(log *slog.Logger) error {
 	thermoReader := &poller.Thermocouple{URL: env("THERMOCOUPLE_MODBUS_URL", "tcp://thermocouple-sim:5023"), Timeout: 2 * time.Second}
 	thermo := poller.New(poller.Config{Name: "thermocouple", Interval: pollInterval, Backoff: poller.Backoff{Base: time.Second, Max: 30 * time.Second, Jitter: 0.2}},
 		thermoReader, db, log, deviceEvent(db, log))
-	for _, current := range []*poller.Poller{sensorPoller, relayHealth, thermo, pwm} {
+	devicePollers := []*poller.Poller{sensorPoller, relayHealth, thermo, pwm}
+	for _, current := range devicePollers {
 		current.SetOnPoll(persistStatus)
+		current.SetPollObserver(operations.ObservePoll)
 	}
 	resetClient := &reset.Client{Addr: env("RESET_TCP_ADDR", "remote-reset-sim:9001"), Timeout: 4 * time.Second}
 	targets := map[string]*poller.Poller{"temp-humidity": sensorPoller, "relay": relayHealth, "thermocouple": thermo, "speed-pwm": pwm}
@@ -222,7 +234,18 @@ func run(log *slog.Logger) error {
 			resetAuditMu.Lock()
 			resetAudits[deviceName] = resetAudit{target: target, actor: claims.Username}
 			resetAuditMu.Unlock()
+			operations.ResetCommand(target, "attempt")
 			_, err := resetClient.Command(ctx, "RESET", target)
+			result := "success"
+			if err != nil {
+				result = "failure"
+			}
+			operations.ResetCommand(target, result)
+			resetAuditMu.Lock()
+			entry := resetAudits[deviceName]
+			entry.acknowledged = err == nil
+			resetAudits[deviceName] = entry
+			resetAuditMu.Unlock()
 			close(ready)
 			return err
 		})
@@ -233,6 +256,15 @@ func run(log *slog.Logger) error {
 			Tokens: tokens, Users: users, Store: db, Relays: relays, Control: engine, Speed: speedControl, Thermocouple: thermoReader, ResetDevice: resetDevice,
 			Statuses: func() []poller.DeviceStatus {
 				return []poller.DeviceStatus{sensorPoller.Status(), relayHealth.Status(), thermo.Status(), pwm.Status()}
+			},
+			Operations: operations,
+			DeviceMetrics: func() []api.DeviceMetrics {
+				devices := make([]api.DeviceMetrics, 0, len(devicePollers))
+				for _, current := range devicePollers {
+					status, measurements := current.Snapshot()
+					devices = append(devices, api.DeviceMetrics{Status: status, Measurements: measurements})
+				}
+				return devices
 			},
 			Log: log,
 		}).Handler(),

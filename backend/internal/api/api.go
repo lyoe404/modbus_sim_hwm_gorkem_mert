@@ -48,16 +48,18 @@ type SpeedController interface {
 	Set(context.Context, int) (speed.State, error)
 }
 type Server struct {
-	Tokens       *auth.Tokens
-	Users        *auth.Users
-	Store        Store
-	Relays       Relays
-	Control      Control
-	Speed        SpeedController
-	Thermocouple *poller.Thermocouple
-	ResetDevice  func(context.Context, string) error
-	Statuses     func() []poller.DeviceStatus
-	Log          *slog.Logger
+	Tokens        *auth.Tokens
+	Users         *auth.Users
+	Store         Store
+	Relays        Relays
+	Control       Control
+	Speed         SpeedController
+	Thermocouple  *poller.Thermocouple
+	ResetDevice   func(context.Context, string) error
+	Statuses      func() []poller.DeviceStatus
+	DeviceMetrics func() []DeviceMetrics
+	Operations    *Operations
+	Log           *slog.Logger
 }
 
 var errDeviceRecovering = errors.New("device recovering")
@@ -348,6 +350,9 @@ func (s *Server) setRelay(w http.ResponseWriter, r *http.Request) {
 		s.audit(claims.Username, fmt.Sprintf("channel=%d label=%q requested=%v result=%s", id, res.Label, *req.On, code))
 	}
 	if err != nil {
+		if status == http.StatusBadGateway || errors.Is(err, relay.ErrReadBackMismatch) {
+			s.Operations.ControlError("manual_relay")
+		}
 		s.Log.Warn("relay write", "user", claims.Username, "channel", id, "err", err)
 		writeJSON(w, status, map[string]any{"error": code, "result": res})
 		return
@@ -465,6 +470,7 @@ func (s *Server) setSpeed(w http.ResponseWriter, r *http.Request) {
 		s.Log.Error("speed audit", "err", auditErr)
 	}
 	if err != nil {
+		s.Operations.ControlError("manual_pwm")
 		writeJSON(w, 502, map[string]any{"error": "speed_write_failed", "detail": err.Error(), "state": st})
 		return
 	}

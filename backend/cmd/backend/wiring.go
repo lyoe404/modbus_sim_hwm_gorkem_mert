@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"backend/internal/api"
 	"backend/internal/control"
 	"backend/internal/poller"
 	"backend/internal/relay"
@@ -38,8 +39,14 @@ func relaySwitch(r *relay.Controller) control.Switch {
 }
 
 // eventRecorder adapts the store's audit log to control.Recorder.
-func eventRecorder(db *store.Store) control.Recorder {
+func eventRecorder(db *store.Store, operations *api.Operations) control.Recorder {
 	return control.RecorderFunc(func(ctx context.Context, kind, source, message, actor string) error {
+		switch kind {
+		case "fan_actuation_failed":
+			operations.ControlError("auto_relay")
+		case "fan_speed_failed":
+			operations.ControlError("auto_pwm")
+		}
 		return db.AddEvent(ctx, store.Event{Kind: kind, Source: source, Message: message, Actor: actor})
 	})
 }

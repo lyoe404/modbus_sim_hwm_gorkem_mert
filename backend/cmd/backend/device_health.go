@@ -17,8 +17,19 @@ func (noopSink) Save(context.Context, []poller.Measurement) error { return nil }
 type relayReader struct{ controller *relay.Controller }
 
 func (r relayReader) Read(ctx context.Context) ([]poller.Measurement, error) {
-	_, err := r.controller.Channels(ctx)
-	return nil, err
+	channels, err := r.controller.Channels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	readings := make([]poller.Measurement, len(channels))
+	for i, channel := range channels {
+		readings[i] = poller.Measurement{Source: channel.Label, Metric: "coil", At: now}
+		if channel.On {
+			readings[i].Value = 1
+		}
+	}
+	return readings, nil
 }
 
 // Controller connection is shared with the API and closed by main after pollers stop.
